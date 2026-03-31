@@ -1,0 +1,248 @@
+---
+title: 'Running the pipeline'
+description: 'Step-by-step guide to executing a complete MEME pipeline cycle, reading its output, and recovering from failures.'
+---
+
+## Pre-run checklist
+
+Before you invoke `main.py`, confirm the following:
+
+<Steps>
+  <Step title="Activate your virtual environment">
+    The project must run inside the `venv` you created during setup. Without it, imports will fail.
+
+    ```bash
+    # Windows
+    venv\Scripts\activate
+
+    # macOS / Linux
+    source venv/bin/activate
+    ```
+  </Step>
+  <Step title="Verify your .env file">
+    `config.py` reads two environment variables at startup. Both must be present in a `.env` file at the project root.
+
+    ```bash
+    # .env
+    OPENAI_API_KEY=your_openai_api_key
+    NEWSAPI_KEY=your_newsapi_key
+    ```
+
+    <Note>
+      The `.env.example` file uses `NEWSAPI_KEY`. Set `NEWSAPI_KEY` in your `.env` so that `data_fetcher/news.py` can read it directly. `config.py` separately reads `NEWS_API_KEY` for its own `NEWSAPI_KEY` constant.
+    </Note>
+  </Step>
+  <Step title="Confirm internet connectivity">
+    The pipeline makes live network calls to Wikipedia (S&P 500 ticker list), NewsAPI, OpenAI, and yfinance. A dropped connection mid-run will cause individual tickers to fail but will not abort the entire pipeline — errors are caught per-ticker and the loop continues.
+  </Step>
+  <Step title="Check ACTIVE_UNIVERSE_LIMIT">
+    Open `config.py` and confirm `ACTIVE_UNIVERSE_LIMIT` is set to a value appropriate for your API tier. The default is `10`, which is safe for testing.
+
+    ```python
+    # config.py
+    ACTIVE_UNIVERSE_LIMIT = 10
+    ```
+  </Step>
+</Steps>
+
+---
+
+## How duplicate-run protection works
+
+The pipeline calls `check_run_exists()` at startup before doing any work. This function queries the `daily_runs` table for today's date:
+
+```python
+# data_manager/db.py
+def check_run_exists(run_date: str, db_path: str = DB_PATH) -> bool:
+    """Verifica si ya se ejecutó el pipeline para esta fecha."""
+    conn = _get_connection(db_path)
+    row = conn.execute(
+        "SELECT id FROM daily_runs WHERE run_date = ?", (run_date,)
+    ).fetchone()
+    conn.close()
+    return row is not None
+```
+
+If a record for today already exists, `run_full_pipeline()` prints a warning and returns immediately — no API calls are made:
+
+```python
+# main.py
+if check_run_exists(run_date_str):
+    print(f"\n⚠ Ya existe una ejecución para {run_date_str}.")
+    print("  Si deseas re-ejecutar, elimina el registro de la DB primero.")
+    return
+```
+
+This means **re-running `main.py` on the same date is a no-op** unless you delete the existing record first. See [deleting a run to re-execute](#deleting-a-run-to-re-execute) below.
+
+---
+
+## What happens during each phase
+
+### Phase 1 — Argument generation
+
+For each ticker in the active universe, the pipeline invokes the LangGraph graph:
+
+```
+fetch_data → [filter_tech, filter_fund, filter_news] (parallel) → generate_arguments
+```
+
+- **fetch_data** pulls technical data and fundamentals from yfinance, and news from NewsAPI.
+- **filter_tech / filter_fund / filter_news** are three parallel filter agents running `gpt-4o-mini`. Each extracts a structured summary from its respective data modality.
+- **generate_arguments** is the generator agent running `gpt-4o`. It synthesizes the three summaries into one or more structured investment arguments, each containing a directional polarity (`1` = bullish, `-1` = bearish), a justification, and evidence.
+
+A 1-second sleep follows each ticker to provide soft rate limiting:
+
+```python
+# main.py
+time.sleep(1)  # Rate limit suave
+```
+
+### Phase 2 — GMM clustering
+
+After all tickers are processed, Phase 2 runs on the collected argument pool:
+
+1. Each argument's justification and evidence are concatenated and converted to a vector using `text-embedding-3-small`.
+2. A Gaussian Mixture Model (GMM) with `K_CLUSTERS` components is fitted on the embedding matrix.
+3. Each argument receives a probability vector across all K narratives. The cluster with the highest probability is its primary assignment.
+4. If a previous day's centroids exist in the database, the Hungarian algorithm aligns today's narrative IDs to yesterday's — preserving continuity across days.
+
+Results are persisted to `daily_runs`, `arguments`, and `narratives` tables.
+
+### Phase 3 — Portfolio construction
+
+1. Close-to-close returns are downloaded from yfinance for all processed tickers.
+2. Returns are averaged per cluster to compute `avg_return` for each narrative.
+3. An Exponential Moving Average (EMA, α=0.2) updates each narrative's momentum by blending today's return with the previous day's EMA.
+4. Tickers are scored by multiplying their polarity-weighted cluster membership probabilities by the EMA momentum of each cluster.
+5. The top 20% of tickers by composite signal form the LONG portfolio; the bottom 20% form the SHORT portfolio (if `ENABLE_SHORT_PORTFOLIO = True`).
+6. Positions are saved to `portfolio_history`.
+
+---
+
+## Reading the console output
+
+### Per-ticker section
+
+```
+───────────────────────────────────────────────────────
+[AAPL] Iniciando análisis vía LangGraph...
+[AAPL] ✓ 3 argumentos generados.
+[AAPL] Tiempo total: 12.4s
+```
+
+Each ticker prints the number of valid arguments generated and the wall-clock time for the full LangGraph call.
+
+### Narrative assignment table
+
+After Phase 2 completes, each argument is printed with its cluster assignment:
+
+```
+  🟢 AAPL   | N- 3 | P=0.87 | Strong revenue guidance and margin expansion...
+  🔴 TSLA   | N- 7 | P=0.61 | Demand concerns in China offset by energy ...
+```
+
+- **🟢 / 🔴** — bullish or bearish polarity of the argument.
+- **N-X** — the narrative (cluster) ID the argument was assigned to.
+- **P=0.XX** — the GMM posterior probability for that cluster (higher = more confident assignment).
+
+### Top narratives by momentum
+
+```
+  TOP NARRATIVAS POR MOMENTUM:
+    1. Narrativa  3: ↗ EMA=0.00123
+    2. Narrativa  7: ↗ EMA=0.00041
+    3. Narrativa 11: ↘ EMA=-0.00089
+```
+
+- **↗** — the narrative has positive EMA momentum (historically profitable arguments in this cluster).
+- **↘** — the narrative has negative EMA momentum.
+- **EMA=0.00123** — the current exponential moving average of close-to-close returns for all tickers whose arguments belong to this narrative. Values are typically small (fractions of a percent) because they represent daily returns.
+
+---
+
+## Understanding the final portfolio report
+
+The report prints two tables: LONG positions (top 20% by signal) and SHORT positions (bottom 20%).
+
+Each row contains:
+- **Ticker** — the stock symbol.
+- **Signal** — the composite score produced by `score_tickers()`. Positive values indicate net bullish narrative alignment; negative values indicate net bearish alignment.
+- **Weight** — equal-weight allocation within the portfolio leg (e.g., 0.333 for 3 positions = 33.3% each).
+- **Rank** — position rank within the leg.
+
+<Note>
+  Both LONG and SHORT legs use equal-weight allocation. The signal is used only for ranking, not for sizing.
+</Note>
+
+---
+
+## What to do if the pipeline fails mid-run
+
+The per-ticker error handling in Phase 1 means the pipeline continues if individual tickers fail. However, if the process is killed before `save_daily_run()` completes, no record is written to `daily_runs` and the run is safe to restart.
+
+If the pipeline dies after `save_daily_run()` runs (i.e., during Phase 3), a partial record exists in the database. In that case, you must delete the run before re-executing.
+
+<Warning>
+  Do not simply re-run `main.py` after a partial failure. `check_run_exists()` will detect the partial record and abort immediately. Delete the run first.
+</Warning>
+
+---
+
+## Deleting a run to re-execute
+
+Use `delete_run.py` to remove all data for a specific date from the database. This resets the duplicate-run guard so `main.py` can run again.
+
+```bash
+# Pass the date as a command-line argument
+python delete_run.py 2025-01-15
+
+# Or run interactively (defaults to today)
+python delete_run.py
+```
+
+The script deletes records in foreign-key-safe order — `arguments`, then `narratives`, then `daily_runs` — and asks for confirmation before proceeding:
+
+```python
+# delete_run.py
+confirm = input(f"  ¿Estás seguro de que deseas borrar TODOS los datos de esta fecha? (s/n): ").lower()
+if confirm != 's':
+    print("  [x] Operación cancelada.")
+    return
+```
+
+Type `s` and press Enter to confirm. Any other input cancels the operation.
+
+---
+
+## Handling common errors
+
+<AccordionGroup>
+  <Accordion title="NewsAPI HTTP 426 or 429">
+    **Cause:** You have exceeded the NewsAPI free tier limit of 100 requests per day, or your plan does not support the requested endpoint.
+
+    **Fix:** Reduce `ACTIVE_UNIVERSE_LIMIT` in `config.py` to stay within 100 tickers per day. If you need a larger universe, upgrade to the NewsAPI Developer plan. The pipeline will continue processing remaining tickers (each failed news fetch is caught per-ticker), but those tickers will have no news summary in their arguments.
+  </Accordion>
+  <Accordion title="OpenAI timeout or RateLimitError">
+    **Cause:** A request to the OpenAI API timed out or hit a rate limit. This is more common when processing a large universe quickly.
+
+    **Fix:** The 1-second sleep between tickers (`time.sleep(1)`) provides basic rate limiting. If you see frequent timeouts, increase this value in `main.py`. For persistent rate limit errors, check your OpenAI usage tier and consider reducing `ACTIVE_UNIVERSE_LIMIT`.
+  </Accordion>
+  <Accordion title="yfinance returns empty data">
+    **Cause:** yfinance cannot retrieve data for a ticker (delisted, symbol change, market holiday, or temporary outage).
+
+    **Fix:** The pipeline records a return of `0.0` for tickers with no data, so the run completes. The affected ticker will have a zero contribution to its cluster's `avg_return`. You will see the count in the console: `Retornos obtenidos: N/M con datos válidos.`
+  </Accordion>
+  <Accordion title="Wikipedia fetch fails (S&P 500 ticker list)">
+    **Cause:** The Wikipedia request for the S&P 500 table timed out or returned an unexpected format.
+
+    **Fix:** `get_sp500_tickers()` automatically falls back to a hardcoded list of 10 tickers:
+
+    ```python
+    # main.py
+    return ["AAPL", "MSFT", "NVDA", "GOOGL", "AMZN", "META", "TSLA", "BRK-B", "LLY", "AVGO"]
+    ```
+
+    The pipeline continues with this fallback universe. No action is required unless you need the full S&P 500 list.
+  </Accordion>
+</AccordionGroup>

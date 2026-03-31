@@ -1,0 +1,215 @@
+---
+title: "Argument extraction"
+description: "How Phase 1 of the MEME pipeline transforms raw technical, fundamental, and news data into structured Investment Argument tuples using a LangGraph fan-out/fan-in architecture."
+---
+
+## The Investment Argument tuple
+
+The atomic unit of information in MEME is the **Investment Argument**, defined as:
+
+```
+A(t, s, i) = (p, a, e)
+```
+
+| Field | Symbol | Description |
+|---|---|---|
+| Polarity | `p` | Directional signal: `+1` (bullish) or `-1` (bearish) |
+| Justification | `a` | The abstract analytical thesis — *why* the price might move |
+| Evidence | `e` | A concrete fact, ratio, or event extracted from the data |
+
+Each argument captures a single logical reason for a price move. By decomposing market signals into discrete (polarity, reasoning, evidence) triples, MEME avoids the noise amplification that occurs when raw numbers are fed directly into a predictive model.
+
+<Note>
+Between 2 and 5 arguments are generated per ticker per day. Multiple arguments per ticker are expected — a company may simultaneously have a bullish technical breakout and a bearish fundamental concern, and both are valid narratives.
+</Note>
+
+## Data sources
+
+The pipeline pulls from two providers for each ticker:
+
+**yfinance** (`fetch_data` node)
+- **Technical data:** 6 months of OHLCV history, from which SMA, RSI, MACD, and other indicators are derived.
+- **Fundamental data:** Ratios such as P/E, EPS, ROI, and operating margins from `yf.Ticker`.
+
+**NewsAPI** (`fetch_data` node)
+- Up to 3 days of recent headlines and article descriptions for the ticker symbol.
+- Configured via `NEWS_DAYS_BACK = 3` in `config.py`.
+
+<Warning>
+The free tier of NewsAPI allows a maximum of 100 requests per day. Each ticker consumes one request, so processing more than 100 tickers will trigger HTTP 426/429 errors from ticker 101 onward. Set `ACTIVE_UNIVERSE_LIMIT` in `config.py` accordingly.
+</Warning>
+
+## LangGraph graph architecture
+
+Phase 1 is implemented as a LangGraph `StateGraph`. The graph runs once per ticker and follows a **fan-out / fan-in** pattern:
+
+```
+START
+  │
+  ▼
+fetch_data          ← downloads yfinance + NewsAPI data
+  │
+  ├──► filter_technical    ─┐
+  ├──► filter_fundamental  ─┼─► generate_arguments ─► END
+  └──► filter_news         ─┘
+       (parallel fan-out)        (fan-in)
+```
+
+The three filter nodes run **in parallel** once `fetch_data` completes. The generator node waits for all three summaries before running. This is the `build_ticker_graph()` function in `agents/graph.py`:
+
+```python
+def build_ticker_graph():
+    builder = StateGraph(TickerState)
+
+    # Nodes
+    builder.add_node("fetch_data", fetch_data)
+    builder.add_node("filter_technical", filter_technical)
+    builder.add_node("filter_fundamental", filter_fundamental)
+    builder.add_node("filter_news", filter_news)
+    builder.add_node("generate_arguments", generate_arguments)
+
+    # Edges: Etapa 1 → Etapa 2 (fan-out a 3 nodos paralelos)
+    builder.add_edge(START, "fetch_data")
+    builder.add_edge("fetch_data", "filter_technical")
+    builder.add_edge("fetch_data", "filter_fundamental")
+    builder.add_edge("fetch_data", "filter_news")
+
+    # Edges: Etapa 2 → Etapa 3 (fan-in, todos convergen al generador)
+    builder.add_edge("filter_technical", "generate_arguments")
+    builder.add_edge("filter_fundamental", "generate_arguments")
+    builder.add_edge("filter_news", "generate_arguments")
+
+    # Edges: Etapa 3 → END
+    builder.add_edge("generate_arguments", END)
+
+    return builder.compile()
+```
+
+## The TickerState TypedDict
+
+The graph's shared state is a typed dictionary that flows through every node:
+
+```python
+class TickerState(TypedDict):
+    ticker: str
+    # Raw data (Stage 1)
+    tech_data: dict
+    fund_data: dict
+    news_data: list
+    # Filtered summaries (Stage 2 - parallel)
+    tech_summary: str
+    fund_summary: str
+    news_summary: str
+    # Final arguments (Stage 3)
+    arguments: list
+    # Execution timings
+    timings: dict
+```
+
+Each node receives the full state and returns only the fields it modifies. LangGraph merges the returned dict back into the shared state automatically.
+
+## The three filter agents
+
+All three filter agents use `gpt-4o-mini` (`LLM_FILTER_MODEL`) at temperature 0.0 for maximum determinism. They operate on a single modality and return a plain-text summary.
+
+### Technical filter agent
+
+```python
+prompt = f"""Estatus: Actuando como Analista Técnico Cuantitativo.
+Tarea: Analizarás las métricas técnicas (precios, SMA, RSI, MACD, etc) proporcionados para la acción {ticker}.
+Objetivo: Identifica si la tendencia es alcista, neutral o bajista basándote excluyentemente en los indicadores proporcionados.
+Ignora detalles irrelevantes, proporciona un resumen claro, concreto y objetivo. Extrae sólo la esencia que impacte al precio a corto/mediano plazo."""
+```
+
+The agent receives the raw technical data dict as the user message and returns a concise directional assessment (bullish / neutral / bearish) based solely on the provided indicators.
+
+### Fundamental filter agent
+
+```python
+prompt = f"""Estatus: Actuando como Analista Fundamental.
+Tarea: Analizarás los ratios fundamentales (P/E, ROI, EPS, Márgenes, etc) proporcionados para la empresa {ticker}.
+Objetivo: Evalúa si los fundamentales demuestran solidez, sobrevaloración o debilidad estructural.
+Ignora detalles irrelevantes, proporciona un resumen claro, concreto y objetivo de las métricas que más pueden afectar al valor en bolsa."""
+```
+
+The agent evaluates whether the fundamentals indicate strength, overvaluation, or structural weakness.
+
+### News sentiment filter agent
+
+```python
+prompt = f"""Estatus: Actuando como Analista de Sentimiento de Noticias.
+Tarea: Analizarás los siguientes titulares de noticias recientes sobre la empresa {ticker}.
+Objetivo: Sintetiza el sentimiento general (positivo, neutral o negativo) y extrae los 2 o 3 eventos o narrativas clave más importantes.
+Ignora ruido publicitario, concéntrate en hechos o anuncios que puedan alterar la perspectiva de inversión a corto plazo."""
+```
+
+The agent synthesizes overall sentiment and extracts the 2–3 most market-relevant events from the last 3 days of headlines.
+
+<Tip>
+Each filter agent is intentionally scoped to a single modality. This isolation prevents cross-hallucination: the technical agent cannot be distracted by negative news, and the news agent cannot be anchored by a bullish RSI reading. Only the generator agent sees all three outputs together.
+</Tip>
+
+## The generator agent
+
+After all three summaries are available, `generate_arguments` runs using `gpt-4o` (`LLM_EXTRACTOR_MODEL`) at temperature 0.2. This slightly higher temperature allows interpretive synthesis while still maintaining structured output.
+
+The system prompt instructs the model to produce only a JSON object:
+
+```python
+system_prompt = f"""Actúas como el Agente Generador del Sistema MEME.
+Se te proporcionan resúmenes limpios de una acción ({ticker}) divididos en tres modalidades: Técnico, Fundamental y Noticias.
+
+Tu tarea es sintetizar toda esta información y extraer una lista estructurada de 'Argumentos de Inversión'.
+Cada argumento debe representar una narrativa lógica subyacente de por qué el precio podría subir o bajar.
+
+Debes devolver UNICAMENTE un JSON con la siguiente estructura:
+{{
+  "argumentos": [
+    {{
+      "polaridad": +1 o -1,
+      "justificacion": "La tesis o razonamiento abstracto de este argumento (máximo un párrafo)",
+      "evidencia": "Un hecho, ratio o evento directo extraído de los resúmenes que respalde la justificación"
+    }}
+  ]
+}}
+
+Genera al menos 2 y máximo 5 argumentos basados exclusivamente en la información provista."""
+```
+
+The user message passes all three summaries in labeled sections:
+
+```python
+user_message = f"""[Resumen Técnico]
+{state.get('tech_summary', 'Sin datos técnicos')}
+
+[Resumen Fundamental]
+{state.get('fund_summary', 'Sin datos fundamentales')}
+
+[Resumen de Noticias]
+{state.get('news_summary', 'Sin datos de noticias')}"""
+```
+
+The model is instructed to use `response_format: {"type": "json_object"}` to enforce structured output. The parser handles both `{"argumentos": [...]}` wrapper objects and bare arrays.
+
+## JSON output format
+
+A successful response from the generator agent looks like this:
+
+```json
+{
+  "argumentos": [
+    {
+      "polaridad": 1,
+      "justificacion": "Strong technical momentum supported by price trading above 50-day and 200-day SMAs, with RSI in bullish territory below overbought threshold, suggesting continuation of the uptrend.",
+      "evidencia": "Price at $182.50, SMA-50 at $171.20, SMA-200 at $158.90, RSI at 62.4"
+    },
+    {
+      "polaridad": -1,
+      "justificacion": "Compressed margins and decelerating revenue growth indicate structural pressure on profitability despite headline earnings beats driven by one-time items.",
+      "evidencia": "Operating margin contracted from 28.1% to 24.6% YoY; revenue growth slowed from 14% to 6%; EPS beat was driven by share buybacks rather than organic earnings growth"
+    }
+  ]
+}
+```
+
+After parsing, each argument is enriched with its `ticker` symbol before being added to the `master_arguments_list` in `main.py`. Invalid or error-containing entries are filtered out before Phase 2 begins.

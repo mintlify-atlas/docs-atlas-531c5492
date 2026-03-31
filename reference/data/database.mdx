@@ -1,0 +1,359 @@
+---
+title: "Database"
+description: "SQLite persistence layer for daily runs, arguments, narrative momentum, and portfolio history."
+---
+
+The `data_manager/db.py` module is the full persistence layer for MEME. It stores every pipeline execution in a local SQLite file so that temporal alignment, EMA continuity, and portfolio history are maintained across days.
+
+**Database file:** `meme_history.db` in the project root (one directory above `data_manager/`).
+
+```python
+DB_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "meme_history.db")
+```
+
+<Note>
+  The module is designed with plain parameterized SQL to make a future PostgreSQL migration straightforward. You only need to swap `sqlite3` for `psycopg2` or `asyncpg` and update column type definitions (`TEXT` → `VARCHAR`, `REAL` → `DOUBLE PRECISION`, etc.).
+</Note>
+
+---
+
+## Connection settings
+
+Every function opens a fresh connection via `_get_connection()` and closes it before returning. Two PRAGMAs are set on every connection:
+
+```python
+conn.execute("PRAGMA journal_mode=WAL")   # Better concurrent read/write
+conn.execute("PRAGMA foreign_keys=ON")    # Enforce referential integrity
+```
+
+WAL (Write-Ahead Logging) mode allows readers to proceed concurrently with a single writer, which improves throughput when the pipeline is logging and querying simultaneously.
+
+---
+
+## Schema
+
+The database contains four tables. All `run_date` foreign keys reference `daily_runs(run_date)`.
+
+<CodeGroup>
+
+```sql daily_runs
+CREATE TABLE IF NOT EXISTS daily_runs (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_date        TEXT NOT NULL UNIQUE,   -- 'YYYY-MM-DD', primary key for lookups
+    universe_size   INTEGER NOT NULL,       -- number of tickers processed
+    total_arguments INTEGER NOT NULL,       -- total LLM arguments generated
+    k_clusters      INTEGER NOT NULL,       -- GMM K used for this run
+    created_at      TEXT NOT NULL DEFAULT (datetime('now'))
+);
+```
+
+```sql arguments
+CREATE TABLE IF NOT EXISTS arguments (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_date        TEXT NOT NULL,
+    ticker          TEXT NOT NULL,
+    cluster_id      INTEGER,        -- top cluster (argmax of posteriors row)
+    polarity        INTEGER NOT NULL,  -- +1 or -1
+    justification   TEXT NOT NULL,
+    evidence        TEXT,
+    probability     REAL,           -- P(top_cluster | argument)
+    embedding_text  TEXT,           -- reserved for future use
+    FOREIGN KEY (run_date) REFERENCES daily_runs(run_date)
+);
+```
+
+```sql narratives
+CREATE TABLE IF NOT EXISTS narratives (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_date        TEXT NOT NULL,
+    cluster_id      INTEGER NOT NULL,
+    centroid_json   TEXT NOT NULL,   -- JSON array of float embedding centroid
+    avg_return      REAL DEFAULT 0.0,
+    ema_momentum    REAL DEFAULT 0.0,
+    n_arguments     INTEGER DEFAULT 0,
+    FOREIGN KEY (run_date) REFERENCES daily_runs(run_date),
+    UNIQUE(run_date, cluster_id)
+);
+```
+
+```sql portfolio_history
+CREATE TABLE IF NOT EXISTS portfolio_history (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_date        TEXT NOT NULL,
+    ticker          TEXT NOT NULL,
+    side            TEXT NOT NULL CHECK(side IN ('LONG', 'SHORT')),
+    rank            INTEGER NOT NULL,
+    signal          REAL NOT NULL,
+    weight          REAL NOT NULL,     -- percentage (e.g. 33.33)
+    created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY (run_date) REFERENCES daily_runs(run_date)
+);
+```
+
+</CodeGroup>
+
+### Indexes
+
+```sql
+CREATE INDEX IF NOT EXISTS idx_arguments_date   ON arguments(run_date);
+CREATE INDEX IF NOT EXISTS idx_arguments_ticker ON arguments(ticker);
+CREATE INDEX IF NOT EXISTS idx_narratives_date  ON narratives(run_date);
+CREATE INDEX IF NOT EXISTS idx_portfolio_date   ON portfolio_history(run_date);
+CREATE INDEX IF NOT EXISTS idx_portfolio_side   ON portfolio_history(side);
+```
+
+---
+
+## Functions
+
+### `init_db`
+
+Creates all four tables and their indexes if they do not already exist. Safe to call on every pipeline startup.
+
+```python
+init_db(db_path: str = DB_PATH)
+```
+
+<ParamField path="db_path" type="str" default="DB_PATH">
+  Path to the SQLite file. Defaults to `meme_history.db` in the project root. Pass a custom path (e.g. `":memory:"`) for testing.
+</ParamField>
+
+Called unconditionally at the top of `run_full_pipeline()` in `main.py`:
+
+```python
+init_db()
+```
+
+---
+
+### `check_run_exists`
+
+Returns `True` if a record for `run_date` already exists in `daily_runs`, preventing duplicate pipeline executions.
+
+```python
+check_run_exists(run_date: str, db_path: str = DB_PATH) -> bool
+```
+
+<ParamField path="run_date" type="str" required>
+  ISO date string `"YYYY-MM-DD"`. Checked against the `UNIQUE` constraint on `daily_runs.run_date`.
+</ParamField>
+
+```python
+if check_run_exists(run_date_str):
+    print(f"⚠ Ya existe una ejecución para {run_date_str}.")
+    return
+```
+
+---
+
+### `save_daily_run`
+
+Persists a complete Phase 1 + Phase 2 result: the `daily_runs` summary row, all individual arguments, and the GMM cluster centroids.
+
+```python
+save_daily_run(
+    run_date: str,
+    arguments: list[dict],
+    posteriors: np.ndarray,
+    centroids: np.ndarray,
+    k_clusters: int,
+    universe_size: int,
+    db_path: str = DB_PATH,
+)
+```
+
+<ParamField path="run_date" type="str" required>
+  ISO date `"YYYY-MM-DD"`.
+</ParamField>
+
+<ParamField path="arguments" type="list[dict]" required>
+  List of argument dicts with keys `ticker`, `polaridad`, `justificacion`, `evidencia`.
+</ParamField>
+
+<ParamField path="posteriors" type="np.ndarray" required>
+  GMM posterior matrix `(N_arguments, K_clusters)`. Used to determine `top_cluster` (argmax) and `probability` for each argument row.
+</ParamField>
+
+<ParamField path="centroids" type="np.ndarray" required>
+  GMM centroid matrix `(K_clusters, embedding_dim)`. Each centroid is serialized to JSON before storage.
+</ParamField>
+
+<ParamField path="k_clusters" type="int" required>
+  Number of clusters `K`.
+</ParamField>
+
+<ParamField path="universe_size" type="int" required>
+  Total number of tickers in the active universe for the run.
+</ParamField>
+
+The function wraps all three INSERTs (`daily_runs`, `arguments`, `narratives`) in a single transaction. On `IntegrityError` (duplicate `run_date`), it rolls back and logs a warning without raising.
+
+---
+
+### `get_previous_centroids`
+
+Retrieves the GMM centroid matrix from the most recent prior run for temporal alignment.
+
+```python
+get_previous_centroids(current_date: str, db_path: str = DB_PATH) -> Optional[np.ndarray]
+```
+
+<ParamField path="current_date" type="str" required>
+  Today's date `"YYYY-MM-DD"`. Queries `narratives.run_date < current_date`.
+</ParamField>
+
+Returns an `np.ndarray` of shape `(K, D)` from the previous trading day, or `None` if no prior run exists. This is used by `clustering/alignment.py` to produce the `cluster_mapping` dict for EMA continuity.
+
+---
+
+### `get_previous_ema`
+
+Retrieves the EMA momentum values from the most recent prior run.
+
+```python
+get_previous_ema(current_date: str, db_path: str = DB_PATH) -> dict
+```
+
+<ParamField path="current_date" type="str" required>
+  Today's date. Queries `narratives.run_date < current_date ORDER BY run_date DESC LIMIT 1`.
+</ParamField>
+
+Returns `{cluster_id: ema_momentum}` for each cluster in the most recent prior run, or an empty dict `{}` on the first run. Passed directly to `calculate_ema` as `previous_ema`.
+
+---
+
+### `update_narrative_returns`
+
+Updates the `avg_return` and `ema_momentum` columns in `narratives` after Phase 3 evaluation completes.
+
+```python
+update_narrative_returns(
+    run_date: str,
+    cluster_returns: dict,
+    cluster_emas: dict,
+    db_path: str = DB_PATH,
+)
+```
+
+<ParamField path="run_date" type="str" required>
+  The date of the run to update. Rows are matched by `(run_date, cluster_id)`.
+</ParamField>
+
+<ParamField path="cluster_returns" type="dict" required>
+  Output of `calculate_cluster_returns` — `{cluster_id: avg_return}`.
+</ParamField>
+
+<ParamField path="cluster_emas" type="dict" required>
+  Output of `calculate_ema` — `{cluster_id: ema_value}`.
+</ParamField>
+
+`narratives` rows are written by `save_daily_run` with `avg_return = 0.0` and `ema_momentum = 0.0`. This function fills them in once actual market returns are available.
+
+---
+
+### `save_portfolio`
+
+Persists the dual Long/Short portfolio to `portfolio_history`.
+
+```python
+save_portfolio(
+    run_date: str,
+    long_portfolio: list[dict],
+    short_portfolio: list[dict],
+    db_path: str = DB_PATH,
+)
+```
+
+<ParamField path="run_date" type="str" required>
+  ISO date `"YYYY-MM-DD"`.
+</ParamField>
+
+<ParamField path="long_portfolio" type="list[dict]" required>
+  Output of `select_portfolio`. Each dict must contain `ticker`, `side`, `rank`, `signal`, `weight`.
+</ParamField>
+
+<ParamField path="short_portfolio" type="list[dict]" required>
+  Output of `select_short_portfolio`. Pass `[]` when shorting is disabled.
+</ParamField>
+
+Both lists are concatenated and inserted in a single transaction. On exception, the transaction is rolled back.
+
+---
+
+### `get_arguments_for_date`
+
+Retrieves all stored arguments for a given date.
+
+```python
+get_arguments_for_date(run_date: str, db_path: str = DB_PATH) -> list[dict]
+```
+
+<ParamField path="run_date" type="str" required>
+  ISO date `"YYYY-MM-DD"`.
+</ParamField>
+
+Returns a list of dicts with keys `ticker`, `cluster_id`, `polarity`, `justification`, `evidence`, `probability`.
+
+---
+
+### `get_narratives_for_date`
+
+Retrieves all narrative rows (cluster metrics) for a given date.
+
+```python
+get_narratives_for_date(run_date: str, db_path: str = DB_PATH) -> list[dict]
+```
+
+<ParamField path="run_date" type="str" required>
+  ISO date `"YYYY-MM-DD"`.
+</ParamField>
+
+Returns a list of dicts with keys `cluster_id`, `avg_return`, `ema_momentum`, `n_arguments`, ordered by `cluster_id`.
+
+---
+
+### `get_portfolio_for_date`
+
+Retrieves portfolio positions for a given date, optionally filtered by side.
+
+```python
+get_portfolio_for_date(
+    run_date: str,
+    side: str = None,
+    db_path: str = DB_PATH,
+) -> list[dict]
+```
+
+<ParamField path="run_date" type="str" required>
+  ISO date `"YYYY-MM-DD"`.
+</ParamField>
+
+<ParamField path="side" type="str" default="None">
+  `"LONG"`, `"SHORT"`, or `None` to return all positions. Filtered via a `WHERE side = ?` clause.
+</ParamField>
+
+Returns a list of dicts with keys `ticker`, `side`, `rank`, `signal`, `weight`, ordered by `side ASC, rank ASC` (or just `rank ASC` when a side is specified).
+
+---
+
+## PostgreSQL migration note
+
+The module's docstring notes the intended migration path:
+
+> Solo cambiarías: `sqlite3` → `psycopg2`/`asyncpg` y los tipos de columna.
+
+Key changes for PostgreSQL:
+
+| SQLite | PostgreSQL equivalent |
+|---|---|
+| `TEXT` | `VARCHAR` or `TEXT` (both work) |
+| `REAL` | `DOUBLE PRECISION` |
+| `INTEGER PRIMARY KEY AUTOINCREMENT` | `SERIAL PRIMARY KEY` or `BIGSERIAL PRIMARY KEY` |
+| `datetime('now')` | `NOW()` |
+| `?` placeholders | `%s` placeholders |
+| `PRAGMA journal_mode=WAL` | Remove (not applicable) |
+| `PRAGMA foreign_keys=ON` | Remove (always enforced) |
+
+<Tip>
+  Because all SQL is parameterized and the schema uses only standard types, you can migrate to PostgreSQL by replacing the `_get_connection` function and updating the two PRAGMA calls — no other changes are needed.
+</Tip>

@@ -1,0 +1,120 @@
+{
+  "projectType": "ai-ml",
+  "projectName": "MEME: Modeling the Evolutionary Modes of Financial Markets",
+  "projectDescription": "A real-time forward-testing implementation of the MEME system that uses LLM agents and Gaussian Mixture Models to identify latent market narratives and construct dual long/short portfolios for S&P 500 stocks.",
+  "theme": "luma",
+  "primaryColor": "#912d37",
+  "lightColor": "#776f67",
+  "darkColor": "#d3cfcc",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "quickstart"
+            ]
+          },
+          {
+            "group": "Concepts",
+            "pages": [
+              "concepts/meme-system",
+              "concepts/argument-extraction",
+              "concepts/mode-identification",
+              "concepts/portfolio-construction"
+            ]
+          },
+          {
+            "group": "Configuration",
+            "pages": [
+              "configuration/environment",
+              "configuration/parameters",
+              "configuration/scheduling"
+            ]
+          },
+          {
+            "group": "Guides",
+            "pages": [
+              "guides/running-the-pipeline",
+              "guides/scaling-universe",
+              "guides/database",
+              "guides/cost-management"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Reference",
+        "groups": [
+          {
+            "group": "Agents",
+            "pages": [
+              "reference/agents/graph",
+              "reference/agents/filter-agents",
+              "reference/agents/generator-agent"
+            ]
+          },
+          {
+            "group": "Clustering",
+            "pages": [
+              "reference/clustering/embeddings",
+              "reference/clustering/gmm-model",
+              "reference/clustering/alignment"
+            ]
+          },
+          {
+            "group": "Evaluation & Portfolio",
+            "pages": [
+              "reference/evaluation/returns",
+              "reference/evaluation/momentum",
+              "reference/portfolio/builder"
+            ]
+          },
+          {
+            "group": "Data",
+            "pages": [
+              "reference/data/fetchers",
+              "reference/data/database"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Logic-Oriented paradigm: extracts underlying market narratives instead of predicting raw returns",
+    "LangGraph-orchestrated parallel agent pipeline (fan-out/fan-in) for concurrent data processing",
+    "Gaussian Mixture Model (GMM) clustering to identify K latent thinking modes/narratives",
+    "Hungarian algorithm for temporal alignment of narratives across consecutive trading days",
+    "EMA momentum smoothing to track long-term narrative profitability and filter noise",
+    "Symmetric dual portfolio: Long Top 20% and Short Bottom 20% by composite signal",
+    "Defensive cash mode when no narratives show positive momentum",
+    "SQLite persistence layer for incremental daily runs, easily scalable to PostgreSQL",
+    "Automated Windows Task Scheduler integration for daily post-market execution",
+    "S&P 500 dynamic universe fetched live from Wikipedia"
+  ],
+  "publicApiSurface": [
+    "run_full_pipeline(universe, run_date_str) — main entry point executing all 3 phases",
+    "run_phase1_for_ticker(ticker) — runs LangGraph agent graph for a single ticker",
+    "ticker_graph.invoke(state) — LangGraph compiled graph for argument extraction",
+    "ModeIdentifierGMM(n_components) — GMM wrapper for narrative discovery",
+    "ModeIdentifierGMM.fit(embeddings) — train GMM on daily argument embeddings",
+    "ModeIdentifierGMM.get_posteriors(embeddings) — returns omega probability matrix",
+    "ModeIdentifierGMM.get_centroids() — returns cluster means (µ)",
+    "align_modes(prev_centroids, new_centroids) — Hungarian temporal alignment",
+    "get_embeddings(texts) — OpenAI text-embedding-3-small wrapper",
+    "score_tickers(arguments, posteriors, ema_momentum, k_clusters) — composite signal calculation",
+    "select_portfolio(ticker_scores, top_pct) — selects Long Top N% portfolio",
+    "select_short_portfolio(ticker_scores, bottom_pct) — selects Short Bottom N% portfolio",
+    "calculate_ema(current_returns, previous_ema, alpha, cluster_mapping) — EMA momentum update",
+    "rank_narratives(ema_scores) — sorts narratives by momentum",
+    "init_db() — initializes SQLite schema",
+    "save_daily_run(run_date, arguments, posteriors, centroids, k_clusters, universe_size) — persists Phase 1+2 results",
+    "save_portfolio(run_date, long_portfolio, short_portfolio) — persists dual portfolio",
+    "get_previous_centroids(current_date) — retrieves prior day centroids for alignment",
+    "get_previous_ema(current_date) — retrieves prior day EMA for momentum continuity"
+  ]
+}

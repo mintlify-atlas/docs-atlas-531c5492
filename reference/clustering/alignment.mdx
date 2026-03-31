@@ -1,0 +1,144 @@
+---
+title: Temporal alignment
+description: Use the Hungarian algorithm to map today's GMM cluster IDs back to yesterday's IDs, ensuring narrative Mode 3 today is the same narrative as Mode 3 yesterday.
+---
+
+The `alignment` module solves the **label-switching problem** that arises when you refit a GMM each day. Because GMM optimization is not constrained to produce consistent cluster numbering, "Mode 3" on Tuesday may correspond to a completely different market narrative than "Mode 3" on Monday, even if the underlying narratives are stable. `align_modes` corrects this by finding the optimal one-to-one mapping between yesterday's centroids and today's centroids.
+
+## Why alignment matters
+
+Each day, MEME fits a fresh GMM to that day's argument embeddings. The resulting K cluster IDs are arbitrary integers assigned by the EM algorithm. Without alignment:
+
+- EMA momentum scores accumulated for "Mode 3" would mix signals from unrelated narratives across days.
+- Portfolio signals would become noisy and incoherent over time.
+
+By solving for the minimum-cost bipartite matching between centroid positions, `align_modes` re-labels today's clusters so that the same narrative gets the same integer ID across consecutive trading days.
+
+---
+
+## Function
+
+### `align_modes`
+
+```python
+def align_modes(centroids_t_minus_1: np.ndarray, centroids_t: np.ndarray) -> dict:
+```
+
+Applies the **Hungarian algorithm** (also known as the Munkres algorithm) to the pairwise Euclidean distance matrix between yesterday's K centroids and today's K centroids. It returns the assignment that minimises the total distance, expressed as a mapping from old cluster IDs to new cluster IDs.
+
+<ParamField path="centroids_t_minus_1" type="np.ndarray" required>
+  The GMM cluster means from the previous trading day (T−1), with shape **(K, D)**. Retrieved from the database via `get_previous_centroids` before alignment is called.
+</ParamField>
+
+<ParamField path="centroids_t" type="np.ndarray" required>
+  The GMM cluster means from today (T), with shape **(K, D)**. Obtained from `ModeIdentifierGMM.get_centroids()` after fitting today's GMM.
+</ParamField>
+
+<ResponseField name="mapping" type="dict">
+  A dictionary `{old_cluster_id: new_cluster_id}` of length K. Each key is an integer index from T−1 and each value is the integer index in T that best corresponds to it.
+
+  **Example:** if `mapping = {0: 2, 1: 0, 2: 1}`, then:
+  - The narrative that was Mode 0 yesterday is now Mode 2 today.
+  - The narrative that was Mode 1 yesterday is now Mode 0 today.
+  - The narrative that was Mode 2 yesterday is now Mode 1 today.
+</ResponseField>
+
+<Warning>
+  `align_modes` raises a `ValueError` if the two centroid arrays have different numbers of rows (i.e. K changed between days). The pipeline in `main.py` guards against this before calling the function:
+
+  ```python
+  if prev_centroids is not None and prev_centroids.shape[0] == centroids.shape[0]:
+      cluster_mapping = align_modes(prev_centroids, centroids)
+  ```
+
+  If K changes (e.g. because the `ACTIVE_UNIVERSE_LIMIT` was edited), alignment is skipped for that day and the pipeline treats it as a fresh start.
+</Warning>
+
+---
+
+## Algorithm
+
+The function builds a **(K × K)** Euclidean distance matrix using `scipy.spatial.distance.cdist`, then passes it to `scipy.optimize.linear_sum_assignment`, which implements the Hungarian algorithm in O(K³) time:
+
+```
+distance_matrix[i, j] = ‖µ_{T-1,i} − µ_{T,j}‖₂
+```
+
+The Hungarian algorithm finds a perfect matching (bijection) `σ` over cluster indices that minimises:
+
+```
+∑ᵢ distance_matrix[i, σ(i)]
+```
+
+The resulting `(row_ind, col_ind)` pair from `linear_sum_assignment` becomes the mapping dict.
+
+---
+
+## Usage in the pipeline
+
+After alignment, `main.py` passes the mapping to `calculate_ema` so that momentum scores are accumulated on consistent narrative IDs:
+
+```python
+# main.py — Phase 2
+
+prev_centroids = get_previous_centroids(run_date_str)
+
+if prev_centroids is not None and prev_centroids.shape[0] == centroids.shape[0]:
+    cluster_mapping = align_modes(prev_centroids, centroids)
+    changes = sum(1 for k, v in cluster_mapping.items() if k != v)
+    print(f"  Alignment: {changes} narratives changed position.")
+else:
+    cluster_mapping = None   # First run — no history to align against
+
+# Phase 3: EMA momentum respects the mapping
+ema_momentum = calculate_ema(
+    current_returns=cluster_returns,
+    previous_ema=prev_ema,
+    alpha=EMA_ALPHA,
+    cluster_mapping=cluster_mapping,
+)
+```
+
+<Tip>
+  On the very first pipeline run there are no previous centroids in the database, so `get_previous_centroids` returns `None` and alignment is skipped. Alignment only activates from the second trading day onward.
+</Tip>
+
+---
+
+## Complete source
+
+```python clustering/alignment.py
+import numpy as np
+from scipy.spatial.distance import cdist
+from scipy.optimize import linear_sum_assignment
+
+def align_modes(centroids_t_minus_1: np.ndarray, centroids_t: np.ndarray) -> dict:
+    """
+    Realiza la alineación temporal de los Modos de Pensamiento desde el día T-1 al día T.
+    Utiliza el Algoritmo Húngaro (linear_sum_assignment) sobre la matriz de distancia euclidiana.
+    
+    Retorna un diccionario indicando un mapeo de {índice_viejo: índice_nuevo}.
+    Por ejemplo, si la narrativa 0 de T-1 ahora es la narrativa 3 en T, la llave 0 valdrá 3.
+    """
+    # Validar dimensiones
+    if centroids_t_minus_1.shape[0] != centroids_t.shape[0]:
+        raise ValueError("La cantidad de centroides de T-1 y T deben ser iguales para la asignación lineal (ej. K=15 constantes).")
+        
+    # Calcular la matriz de distancias euclidianas entre todos los pares (T-1, T)
+    distance_matrix = cdist(centroids_t_minus_1, centroids_t, metric='euclidean')
+    
+    # Aplicar Algoritmo Húngaro (Mínimo coste total de emparejamiento)
+    row_ind, col_ind = linear_sum_assignment(distance_matrix)
+    
+    # Construir mapa de asignación
+    mapping = {int(old_idx): int(new_idx) for old_idx, new_idx in zip(row_ind, col_ind)}
+    
+    return mapping
+```
+
+## Dependency reference
+
+| Import | Purpose |
+|---|---|
+| `scipy.spatial.distance.cdist` | Computes the full K×K pairwise Euclidean distance matrix in one call |
+| `scipy.optimize.linear_sum_assignment` | Solves the assignment problem using the Hungarian algorithm |

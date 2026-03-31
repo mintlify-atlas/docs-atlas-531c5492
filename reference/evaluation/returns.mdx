@@ -1,0 +1,245 @@
+---
+title: "Returns"
+description: "Close-to-close return fetching and cluster-level return aggregation via GMM posteriors."
+---
+
+The `evaluation/returns.py` module measures how well each narrative predicted real price movement. It downloads close-to-close price returns for every ticker in the argument universe and aggregates them per cluster using the GMM posterior probabilities.
+
+## `get_daily_returns`
+
+Downloads close-to-close returns for a list of tickers in a single batch yfinance call.
+
+```python
+get_daily_returns(tickers: list[str], reference_date: str) -> dict
+```
+
+### How close-to-close return is calculated
+
+For each ticker, the function looks at the two most recent closing prices available on or before `reference_date` and computes:
+
+```
+return = (close[-1] - close[-2]) / close[-2]
+```
+
+Because markets close on weekends and holidays, the function searches **10 calendar days back** from `reference_date` to guarantee at least two trading sessions are present in the window.
+
+### Parameters
+
+<ParamField path="tickers" type="list[str]" required>
+  List of ticker symbols (e.g. `["AAPL", "MSFT", "NVDA"]`). All tickers are fetched in a single `yf.download` batch call.
+</ParamField>
+
+<ParamField path="reference_date" type="str" required>
+  ISO-format date string `"YYYY-MM-DD"` used as the upper boundary for the price window. Today's date is passed from `main.py`.
+</ParamField>
+
+### Returns
+
+A `dict` mapping each ticker to its float return value. Tickers that have no data (market holiday, delisted, or a yfinance error) default to `0.0`.
+
+```python
+{
+    "AAPL": 0.012345,
+    "MSFT": -0.005678,
+    "NVDA": 0.0,        # no data — defaults to 0.0
+}
+```
+
+### Error handling
+
+| Condition | Behavior |
+|---|---|
+| yfinance raises any exception | Logs a warning, returns `{ticker: 0.0}` for all tickers |
+| yfinance returns an empty DataFrame | Logs `"¿Mercado cerrado?"`, returns `{ticker: 0.0}` for all tickers |
+| Individual ticker has fewer than 2 closes | That ticker returns `0.0` |
+
+<Warning>
+  `get_daily_returns` does **not** retry on network failures. If the batch download fails, every ticker in the run receives a `0.0` return, which will flatten the EMA momentum update for that day.
+</Warning>
+
+### Source
+
+```python
+def get_daily_returns(tickers: list[str], reference_date: str) -> dict:
+    """
+    Descarga el retorno diario (Close-to-Close) para un conjunto de tickers.
+    Usa una sola llamada batch a yfinance para todos los tickers.
+
+    Maneja fines de semana y feriados buscando hacia atrás los últimos
+    días de mercado abierto.
+
+    Args:
+        tickers: Lista de símbolos bursátiles.
+        reference_date: Fecha de referencia 'YYYY-MM-DD'.
+
+    Returns:
+        dict {ticker: return_pct} donde return_pct es la variación porcentual
+        entre los dos últimos cierres disponibles.
+        Tickers sin datos retornan 0.0.
+    """
+    from datetime import datetime, timedelta
+
+    returns = {}
+    ref_dt = datetime.strptime(reference_date, "%Y-%m-%d")
+
+    # Buscar 10 días calendario hacia atrás para cubrir fines de semana y feriados
+    start_dt = ref_dt - timedelta(days=10)
+    # Un día extra hacia adelante por si ref_date fue día hábil
+    end_dt = ref_dt + timedelta(days=1)
+
+    try:
+        data = yf.download(
+            tickers,
+            start=start_dt.strftime("%Y-%m-%d"),
+            end=end_dt.strftime("%Y-%m-%d"),
+            group_by="ticker",
+            auto_adjust=True,
+            progress=False,
+            timeout=15,
+        )
+    except Exception as e:
+        print(f"  [WARN] Error descargando retornos: {e}")
+        return {t: 0.0 for t in tickers}
+
+    if data.empty:
+        print("  [WARN] yfinance devolvió DataFrame vacío. ¿Mercado cerrado?")
+        return {t: 0.0 for t in tickers}
+
+    for ticker in tickers:
+        try:
+            if len(tickers) == 1:
+                ticker_data = data
+            else:
+                ticker_data = data[ticker]
+
+            closes = ticker_data["Close"].dropna()
+
+            if len(closes) >= 2:
+                # Retorno entre los dos últimos cierres disponibles
+                ret = (closes.iloc[-1] - closes.iloc[-2]) / closes.iloc[-2]
+                returns[ticker] = float(ret)
+            else:
+                returns[ticker] = 0.0
+
+        except Exception:
+            returns[ticker] = 0.0
+
+    return returns
+```
+
+---
+
+## `calculate_cluster_returns`
+
+Computes the real average return of each cluster/narrative by weighting ticker returns with their GMM posterior probabilities and argument polarity.
+
+```python
+calculate_cluster_returns(
+    arguments: list[dict],
+    posteriors: np.ndarray,
+    daily_returns: dict,
+    k_clusters: int,
+) -> dict
+```
+
+### How polarity-adjusted weighting works
+
+For every argument:
+
+1. The ticker's real return is looked up from `daily_returns`.
+2. The return is **multiplied by the argument's polarity** (`+1` bullish, `-1` bearish). A bearish argument on a stock that fell produces a **positive** adjusted return, meaning the narrative was correct.
+3. For each cluster `k`, the adjusted return is multiplied by the GMM posterior probability `P(k | argument)` and added to that cluster's bucket.
+4. Clusters with a posterior below `0.01` are ignored to reduce noise.
+
+```
+adjusted_return = polarity × real_return
+cluster_k contribution = P(k | arg) × adjusted_return
+cluster_k avg_return   = mean(all contributions to k)
+```
+
+### Parameters
+
+<ParamField path="arguments" type="list[dict]" required>
+  The full list of investment arguments for the run. Each dict must contain `ticker` and `polaridad` keys. Produced by the LangGraph `generate_arguments` node.
+</ParamField>
+
+<ParamField path="posteriors" type="np.ndarray" required>
+  GMM posterior probability matrix of shape `(N_arguments, K_clusters)`. Row `i` contains the soft cluster membership probabilities for argument `i`.
+</ParamField>
+
+<ParamField path="daily_returns" type="dict" required>
+  Output of `get_daily_returns` — `{ticker: float}` mapping.
+</ParamField>
+
+<ParamField path="k_clusters" type="int" required>
+  Number of GMM clusters `K`. Determines which cluster IDs are iterated over.
+</ParamField>
+
+### Returns
+
+```python
+{
+    0: 0.003241,   # cluster 0 narratives were right on average
+    1: -0.001102,  # cluster 1 narratives were wrong on average
+    2: 0.0,        # no data or no arguments assigned
+}
+```
+
+<ResponseField name="cluster_id" type="int">
+  Zero-based integer key identifying the narrative cluster.
+</ResponseField>
+
+<ResponseField name="avg_weighted_return" type="float">
+  Mean of all `P(k | arg) × polarity × return` contributions for that cluster. Returns `0.0` if the cluster received no contributions above the 0.01 probability threshold.
+</ResponseField>
+
+### Source
+
+```python
+def calculate_cluster_returns(
+    arguments: list[dict],
+    posteriors: np.ndarray,
+    daily_returns: dict,
+    k_clusters: int,
+) -> dict:
+    cluster_weighted_returns = defaultdict(list)
+
+    for idx, arg in enumerate(arguments):
+        ticker = arg.get("ticker", "UNKNOWN")
+        polarity = int(arg.get("polaridad", 0))
+        real_return = daily_returns.get(ticker, 0.0)
+
+        # Retorno ajustado por polaridad: si el argumento bajista acertó, es positivo
+        adjusted_return = polarity * real_return
+
+        # Distribuir a cada cluster ponderado por probabilidad
+        for cluster_id in range(k_clusters):
+            prob = posteriors[idx][cluster_id]
+            if prob > 0.01:  # Ignorar clusters con probabilidad despreciable
+                cluster_weighted_returns[cluster_id].append(prob * adjusted_return)
+
+    # Promediar
+    result = {}
+    for cluster_id in range(k_clusters):
+        values = cluster_weighted_returns.get(cluster_id, [])
+        result[cluster_id] = float(np.mean(values)) if values else 0.0
+
+    return result
+```
+
+---
+
+## Usage in the pipeline
+
+Both functions are called in `main.py` during **Phase 3** of the full pipeline:
+
+```python
+# Phase 3.1 — download real returns
+unique_tickers = list(set(arg.get("ticker") for arg in valid_arguments))
+daily_returns = get_daily_returns(unique_tickers, run_date_str)
+
+# Phase 3.2 — aggregate by cluster
+cluster_returns = calculate_cluster_returns(valid_arguments, posteriors, daily_returns, k)
+```
+
+The resulting `cluster_returns` dict is immediately passed to `calculate_ema` in `evaluation/momentum.py` to update the narrative momentum scores.

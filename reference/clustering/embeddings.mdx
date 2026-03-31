@@ -1,0 +1,142 @@
+---
+title: Embeddings
+description: Convert argument dicts into semantic float vectors using OpenAI's text-embedding-3-small model, producing the input matrix for GMM clustering.
+---
+
+The `embeddings` module transforms structured argument dictionaries into dense numerical vectors. Each vector captures the semantic meaning of an analyst's reasoning and evidence, enabling the GMM to discover latent narrative clusters across the market.
+
+## Functions
+
+### `get_embeddings`
+
+Calls the OpenAI Embeddings API to generate one float vector per input text. The model is controlled by the `EMBEDDING_MODEL` constant in `config.py`, currently set to `text-embedding-3-small`.
+
+```python
+def get_embeddings(texts: list[str]) -> list[list[float]]:
+```
+
+<ParamField path="texts" type="list[str]" required>
+  A list of plain-text strings to embed. In the MEME pipeline, you pass the output of [`prepare_argument_for_embedding`](#prepare_argument_for_embedding) for every valid argument collected in Phase 1.
+</ParamField>
+
+<ResponseField name="embeddings" type="list[list[float]]">
+  A list of D-dimensional float vectors — one per input string — where D is the dimensionality of the `text-embedding-3-small` model (1,536 dimensions). Returns an empty list `[]` if `texts` is empty or if the API call fails.
+</ResponseField>
+
+<Warning>
+  The function raises a `ValueError` at startup if `OPENAI_API_KEY` is absent or equals the placeholder string `"INSERTA_TU_KEY_AQUI"`. Set the environment variable before calling this function.
+</Warning>
+
+<Note>
+  On any API exception the function prints the error and returns `[]` rather than propagating. The main pipeline checks for an empty return and halts Phase 2 before attempting GMM training on missing data.
+</Note>
+
+#### How embeddings feed into the GMM
+
+In `main.py`, the raw list returned by `get_embeddings` is immediately converted to a NumPy matrix and handed to [`ModeIdentifierGMM.fit`](/reference/clustering/gmm-model#fit):
+
+```python
+embeddings_matrix = get_embeddings(texts_to_embed)
+embeddings_np = np.array(embeddings_matrix)   # shape: (N, D)
+
+gmm_model = ModeIdentifierGMM(n_components=k)
+gmm_model.fit(embeddings_np)
+```
+
+The resulting matrix has shape **(N, D)**, where N is the number of valid arguments collected that day and D is the embedding dimensionality.
+
+---
+
+### `prepare_argument_for_embedding`
+
+Serializes a single argument dictionary into a single string suitable for embedding. The string concatenates the justification and evidence fields, separated by a pipe delimiter.
+
+```python
+def prepare_argument_for_embedding(argument: dict) -> str:
+```
+
+<ParamField path="argument" type="dict" required>
+  A structured argument dictionary produced by the LangGraph Phase 1 agents. The function reads two keys:
+
+  <Expandable title="Expected keys">
+    <ResponseField name="justificacion" type="string">
+      The analyst's narrative reasoning for the bullish or bearish view. Falls back to an empty string if the key is absent.
+    </ResponseField>
+    <ResponseField name="evidencia" type="string">
+      Concrete evidence cited to support the justification. Falls back to an empty string if the key is absent.
+    </ResponseField>
+  </Expandable>
+</ParamField>
+
+<ResponseField name="text" type="string">
+  A formatted string of the form:
+
+  ```
+  {justificacion} | Evidencia: {evidencia}
+  ```
+
+  This string is the semantic unit passed to the embedding model. The pipe delimiter explicitly separates reasoning from evidence, giving the model a consistent structure to encode.
+</ResponseField>
+
+<Note>
+  The `polaridad` field (bullish/bearish signal) is intentionally excluded from the embedding string. Polarity is preserved in the argument dict and used later in portfolio scoring; the embedding captures *what* the narrative says, not *which direction* it points.
+</Note>
+
+#### Usage in the pipeline
+
+```python
+texts_to_embed = [prepare_argument_for_embedding(arg) for arg in valid_arguments]
+embeddings_matrix = get_embeddings(texts_to_embed)
+```
+
+---
+
+## Complete source
+
+```python clustering/embeddings.py
+import os
+from openai import OpenAI
+from dotenv import load_dotenv
+from config import EMBEDDING_MODEL
+
+load_dotenv()
+
+def get_embeddings(texts: list[str]) -> list[list[float]]:
+    """
+    Genera embeddings vectoriales para una lista de textos
+    usando el modelo definido en la configuración para OpenAI.
+    """
+    client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+    
+    if not client.api_key or client.api_key == "INSERTA_TU_KEY_AQUI":
+        raise ValueError("OPENAI_API_KEY no detectada. Imposible generar Embeddings.")
+    
+    if not texts:
+        return []
+
+    try:
+        response = client.embeddings.create(
+            input=texts,
+            model=EMBEDDING_MODEL
+        )
+        return [data.embedding for data in response.data]
+    except Exception as e:
+        print(f"Error al generar embeddings: {e}")
+        return []
+
+def prepare_argument_for_embedding(argument: dict) -> str:
+    """
+    Concatena el razonamiento y la evidencia para crear el
+    input semántico requerido para agrupar las narrativas.
+    """
+    justificacion = argument.get("justificacion", "")
+    evidencia = argument.get("evidencia", "")
+    return f"{justificacion} | Evidencia: {evidencia}"
+```
+
+## Configuration reference
+
+| Constant | Value | Source |
+|---|---|---|
+| `EMBEDDING_MODEL` | `"text-embedding-3-small"` | `config.py` |
+| `OPENAI_API_KEY` | read from environment | `config.py` / `.env` |

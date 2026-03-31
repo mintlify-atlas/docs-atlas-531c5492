@@ -1,80 +1,215 @@
 ---
 title: "Quickstart"
-description: "Start building awesome documentation in minutes"
+description: "Set up your environment and run the full three-phase MEME pipeline for the first time."
 ---
 
-## Get started in three steps
+## Prerequisites
 
-Get your documentation site running locally and make your first customization.
+Before you begin, make sure you have:
 
-### Step 1: Set up your local environment
+- **Python 3.10 or higher** — the pipeline uses `match` statements and modern type hints
+- An **OpenAI API key** — used for argument extraction (`gpt-4o`, `gpt-4o-mini`) and embeddings (`text-embedding-3-small`)
+- A **NewsAPI key** — used to fetch recent news for each ticker ([newsapi.org](https://newsapi.org))
 
-<AccordionGroup>
-  <Accordion icon="copy" title="Clone your docs locally">
-    During the onboarding process, you created a GitHub repository with your docs content if you didn't already have one. You can find a link to this repository in your [dashboard](https://dashboard.mintlify.com).
-    
-    To clone the repository locally so that you can make and preview changes to your docs, follow the [Cloning a repository](https://docs.github.com/en/repositories/creating-and-managing-repositories/cloning-a-repository) guide in the GitHub docs.
-  </Accordion>
-  <Accordion icon="rectangle-terminal" title="Start the preview server">
-    1. Install the Mintlify CLI: `npm i -g mint`
-    2. Navigate to your docs directory and run: `mint dev`
-    3. Open `http://localhost:3000` to see your docs live!
-    
-    <Tip>Your preview updates automatically as you edit files.</Tip>
-  </Accordion>
-</AccordionGroup>
+<Warning>
+  The free tier of NewsAPI is limited to **100 requests per day**. Each ticker in your active universe consumes one request. The default `ACTIVE_UNIVERSE_LIMIT = 10` in `config.py` stays well within this limit. Do not increase it beyond 100 without a paid NewsAPI plan.
+</Warning>
 
-### Step 2: Deploy your changes
+<Warning>
+  OpenAI charges per token. Running `gpt-4o` over news articles for every ticker adds up quickly. At the default limit of 10 tickers, costs are minimal. At 500 tickers (full S&P 500), daily runs will generate a material monthly bill. See [/configuration/parameters](/configuration/parameters) before scaling up.
+</Warning>
 
-<AccordionGroup>
-  <Accordion icon="github" title="Install our GitHub app">
-    Install the Mintlify GitHub app from your [dashboard](https://dashboard.mintlify.com/settings/organization/github-app).
-    
-    Our GitHub app automatically deploys your changes to your docs site, so you don't need to manage deployments yourself.
-</Accordion>
-<Accordion icon="palette" title="Update your site name and colors">
-    For a first change, let's update the name and colors of your docs site.
+---
 
-    1. Open `docs.json` in your editor.
-    2. Change the `"name"` field to your project name.
-    3. Update the `"colors"` to match your brand.
-    4. Save and see your changes instantly at `http://localhost:3000`.
+## Set up and run the pipeline
 
-    <Tip>Try changing the primary color to see an immediate difference!</Tip>
-  </Accordion>
-</AccordionGroup>
+<Steps>
+  <Step title="Clone the repository">
+    ```bash
+    git clone https://github.com/EconomiaUNMSM/MEME.git
+    cd MEME
+    ```
+  </Step>
 
-### Step 3: Go live
+  <Step title="Create and activate a virtual environment">
+    The automation scripts (`run_meme.bat`) expect the Python executable at `venv/Scripts/python`. Create the virtual environment inside the project root.
 
-<Accordion icon="rocket" title="Publish your docs">
-  1. Commit and push your changes.
-  2. Your docs will update and be live in moments!
-</Accordion>
+    ```bash
+    # Create the virtual environment
+    python -m venv venv
+
+    # Activate it (Windows)
+    venv\Scripts\activate
+
+    # Activate it (macOS / Linux)
+    source venv/bin/activate
+    ```
+
+    <Note>
+      You must activate the virtual environment before installing dependencies or running the pipeline manually. Your prompt should show `(venv)` when it is active.
+    </Note>
+  </Step>
+
+  <Step title="Install dependencies">
+    ```bash
+    pip install -r requirements.txt
+    ```
+
+    This installs: `yfinance`, `pandas`, `ta`, `requests`, `openai`, `python-dotenv`, `scikit-learn`, `scipy`, `langgraph`, `langchain-openai`, `lxml`, and `html5lib`.
+  </Step>
+
+  <Step title="Configure your .env file">
+    Copy `.env.example` to `.env` in the project root and fill in your API keys:
+
+    ```bash
+    cp .env.example .env
+    ```
+
+    Then open `.env` and set both values:
+
+    ```env
+    # OpenAI API Key for Argument Extraction and Cluster Generation
+    OPENAI_API_KEY=your_openai_api_key_here
+
+    # NewsAPI Key for real-time market event extraction (Free or Premium)
+    NEWSAPI_KEY=your_newsapi_key_here
+    ```
+
+    <Tip>
+      You can get a free NewsAPI key at [newsapi.org/register](https://newsapi.org/register). The free plan supports up to 100 requests/day, which covers up to 100 tickers per run.
+    </Tip>
+  </Step>
+
+  <Step title="Run the pipeline">
+    **Option A — Windows batch file (recommended for daily automation):**
+
+    ```bash
+    run_meme.bat
+    ```
+
+    This activates the virtual environment and runs `main.py` in one step, then appends a timestamped entry to `meme_logs.txt`.
+
+    **Option B — Direct Python invocation:**
+
+    ```bash
+    python main.py
+    ```
+
+    Use this option on macOS/Linux or when you have already activated the virtual environment.
+
+    <Note>
+      On first run, the pipeline fetches the current S&P 500 ticker list from Wikipedia. If that request fails, it falls back to a hardcoded list of 10 large-cap tickers: `AAPL`, `MSFT`, `NVDA`, `GOOGL`, `AMZN`, `META`, `TSLA`, `BRK-B`, `LLY`, `AVGO`.
+    </Note>
+  </Step>
+</Steps>
+
+---
+
+## What the output looks like
+
+A successful run produces console output across three phases:
+
+**Phase 1 — Argument extraction**
+
+```
+═════════════════════════════════════════════════════════════════
+  FASE 1: Generación de Argumentos (10 acciones)
+═════════════════════════════════════════════════════════════════
+
+───────────────────────────────────────────────────────
+[AAPL] Iniciando análisis vía LangGraph...
+[AAPL] ✓ 3 argumentos generados.
+[AAPL] Tiempo total: 8.3s
+
+  FASE 1 COMPLETADA: 28 argumentos en 94.2s
+```
+
+**Phase 2 — Mode identification**
+
+```
+═════════════════════════════════════════════════════════════════
+  FASE 2: Embeddings y Descubrimiento de Modos (K=15)
+═════════════════════════════════════════════════════════════════
+  Generando embeddings para 28 argumentos...
+  ✓ Matriz de embeddings: (28, 1536)
+  Entrenando GMM con K=15 narrativas...
+  ℹ Sin historial previo. Primera ejecución (sin alineación).
+
+  ASIGNACIÓN DE NARRATIVAS:
+  ───────────────────────────────────────────────────────
+  🟢 AAPL   | N- 3 | P=0.87 | Strong iPhone upgrade cycle driven by AI featu...
+  🔴 MSFT   | N- 7 | P=0.91 | Enterprise cloud spend softening amid budget r...
+```
+
+**Phase 3 — Portfolio construction**
+
+```
+═════════════════════════════════════════════════════════════════
+  FASE 3: Evaluación de Narrativas y Construcción de Portafolio
+═════════════════════════════════════════════════════════════════
+  Descargando retornos reales para 10 tickers...
+  ✓ Retornos obtenidos: 10/10 con datos válidos.
+
+  TOP NARRATIVAS POR MOMENTUM:
+    1. Narrativa  3: ↗ EMA=0.00412
+    2. Narrativa  7: ↗ EMA=0.00198
+    ...
+
+═════════════════════════════════════════════════════════════════
+  PIPELINE COMPLETO: 143.7s totales (14.4s/ticker)
+  Fecha: 2026-03-31
+  Argumentos: 28
+  Narrativas: 15
+  Portafolio LONG:  2 acciones
+  Portafolio SHORT: 2 acciones
+═════════════════════════════════════════════════════════════════
+```
+
+<Note>
+  On the **first run**, there is no previous day's data in the database, so temporal alignment is skipped and EMA values are seeded from today's returns. The portfolio signal improves as the database accumulates multiple days of history.
+</Note>
+
+---
+
+## Default universe size
+
+`config.py` sets `ACTIVE_UNIVERSE_LIMIT = 10` by default. This means only the first 10 tickers from the S&P 500 list are processed per run. This is intentional — it keeps costs low and requests within the free NewsAPI quota while you verify the pipeline is working correctly.
+
+Once the pipeline is running cleanly end-to-end, you can increase this value. See [/configuration/parameters](/configuration/parameters) for all tunable settings and their cost/performance trade-offs.
+
+---
+
+## Automate daily runs (Windows)
+
+To run the pipeline automatically every weekday at 18:00 Peru time (one and a half hours after the NYSE close), run `setup_schedule.bat` once as Administrator:
+
+```bash
+setup_schedule.bat
+```
+
+This registers a Windows Task Scheduler job named `MEME_DailyRun` that calls `run_meme.bat` daily at 18:00. To verify or remove it:
+
+```bash
+# Verify the task exists
+schtasks /query /tn "MEME_DailyRun"
+
+# Remove the task
+schtasks /delete /tn "MEME_DailyRun" /f
+```
+
+<Warning>
+  The machine must be powered on and connected to the internet at 18:00 each day for the scheduled task to run. Missing a day creates a gap in the EMA momentum history stored in `meme_history.db`.
+</Warning>
+
+---
 
 ## Next steps
 
-Now that you have your docs running, explore these key features:
-
 <CardGroup cols={2}>
-
-<Card title="Write Content" icon="pen-to-square" href="/essentials/markdown">
-  Learn MDX syntax and start writing your documentation.
-</Card>
-
-<Card title="Customize style" icon="palette" href="/essentials/settings">
-  Make your docs match your brand perfectly.
-</Card>
-
-<Card title="Add code examples" icon="square-code" href="/essentials/code">
-  Include syntax-highlighted code blocks.
-</Card>
-
-<Card title="API documentation" icon="code" href="/api-reference/introduction">
-  Auto-generate API docs from OpenAPI specs.
-</Card>
-
+  <Card title="Configuration reference" icon="sliders" href="/configuration/parameters">
+    Adjust universe size, cluster count, portfolio percentiles, and AI model selection.
+  </Card>
+  <Card title="How MEME works" icon="brain" href="/concepts/meme-system">
+    Understand the three-phase methodology in detail.
+  </Card>
 </CardGroup>
-
-<Note>
-  **Need help?** See our [full documentation](https://mintlify.com/docs) or join our [community](https://mintlify.com/community).
-</Note>

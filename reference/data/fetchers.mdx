@@ -1,0 +1,419 @@
+---
+title: "Data Fetchers"
+description: "Technical indicators, fundamental ratios, and news headlines — the three data sources feeding the LangGraph argument pipeline."
+---
+
+MEME collects three types of market data before generating investment arguments. Each fetcher module is responsible for a single data source and returns a clean dict or list that the LangGraph `fetch_data` node assembles into the ticker state.
+
+<Note>
+  None of the fetcher functions are called directly from `main.py`. They are invoked exclusively inside the `fetch_data` node in `agents/graph.py`, which runs once per ticker before the three parallel filter agents.
+</Note>
+
+---
+
+## `data_fetcher/technicals.py`
+
+### `get_latest_technical_summary`
+
+Computes technical indicators from a pre-downloaded OHLCV DataFrame and returns the most recent values as a flat dict.
+
+```python
+get_latest_technical_summary(price_df: pd.DataFrame) -> dict
+```
+
+The function does **not** download price data itself. The caller (`fetch_data`) is responsible for downloading the DataFrame via `yf_ticker.history(period="6mo")` before passing it in. This design avoids duplicate yfinance API calls per ticker.
+
+Internally, `get_latest_technical_summary` calls `get_technical_data(df)` which mutates the DataFrame to add the following columns:
+
+| Column | Indicator | Library call |
+|---|---|---|
+| `SMA_20` | 20-day Simple Moving Average | `ta.trend.sma_indicator(window=20)` |
+| `SMA_50` | 50-day SMA | `ta.trend.sma_indicator(window=50)` |
+| `SMA_200` | 200-day SMA | `ta.trend.sma_indicator(window=200)` |
+| `RSI_14` | 14-period Relative Strength Index | `ta.momentum.rsi(window=14)` |
+| `MACD_12_26_9` | MACD line (12/26 EMA) | `ta.trend.macd()` |
+| `MACDh_12_26_9` | MACD histogram | `ta.trend.macd_diff()` |
+| `BBU_20_2` | Bollinger upper band | `ta.volatility.bollinger_hband()` |
+| `BBL_20_2` | Bollinger lower band | `ta.volatility.bollinger_lband()` |
+| `ATR_14` | 14-period Average True Range | `ta.volatility.average_true_range()` |
+
+### Parameters
+
+<ParamField path="price_df" type="pd.DataFrame" required>
+  An OHLCV DataFrame with at minimum `Open`, `High`, `Low`, `Close`, and `Volume` columns. The index must be a `DatetimeIndex`. Pass a `.copy()` to avoid mutating the caller's DataFrame.
+</ParamField>
+
+### Returns
+
+A flat dict with the most recent row's values. Fields with no data (e.g. SMA_200 requires 200 bars of history) return `None`.
+
+```python
+{
+    "date":           "2026-03-28",
+    "close":          189.50,
+    "volume":         58234100,
+    "sma_20":         185.20,
+    "sma_50":         179.80,
+    "sma_200":        165.40,
+    "rsi_14":         62.14,
+    "macd":           2.3412,
+    "macd_histogram": 0.4521,
+    "bb_upper":       198.30,
+    "bb_lower":       172.10,
+    "atr_14":         3.82,
+}
+```
+
+<ResponseField name="date" type="str">ISO date of the most recent trading session.</ResponseField>
+<ResponseField name="close" type="float">Closing price rounded to 2 decimal places.</ResponseField>
+<ResponseField name="volume" type="int">Trading volume as an integer.</ResponseField>
+<ResponseField name="sma_20 / sma_50 / sma_200" type="float | null">Simple Moving Averages, or `None` if insufficient history.</ResponseField>
+<ResponseField name="rsi_14" type="float | null">RSI (0–100), or `None` if insufficient history.</ResponseField>
+<ResponseField name="macd" type="float | null">MACD line value, rounded to 4 decimal places.</ResponseField>
+<ResponseField name="macd_histogram" type="float | null">MACD histogram (signal divergence), rounded to 4 decimal places.</ResponseField>
+<ResponseField name="bb_upper / bb_lower" type="float | null">Bollinger band boundaries.</ResponseField>
+<ResponseField name="atr_14" type="float | null">Average True Range, a measure of daily volatility.</ResponseField>
+
+### Limitations
+
+- Requires the `ta` (Technical Analysis) library.
+- Returns an empty dict `{}` if `price_df` is `None` or empty.
+- SMA_200 returns `None` for tickers with fewer than 200 trading days of history (e.g. recent IPOs).
+
+### Source
+
+```python
+def get_latest_technical_summary(df: pd.DataFrame) -> dict:
+    """
+    Retorna los datos técnicos más recientes en formato diccionario.
+    Recibe un DataFrame con indicadores ya calculados.
+    """
+    df_enriched = get_technical_data(df)
+    if df_enriched.empty:
+        return {}
+
+    latest = df_enriched.iloc[-1].to_dict()
+    latest_date = df_enriched.index[-1].strftime("%Y-%m-%d")
+
+    return {
+        "date": latest_date,
+        "close": round(latest["Close"], 2),
+        "volume": int(latest["Volume"]),
+        "sma_20": round(latest.get("SMA_20", 0), 2) if latest.get("SMA_20") else None,
+        "sma_50": round(latest.get("SMA_50", 0), 2) if latest.get("SMA_50") else None,
+        "sma_200": round(latest.get("SMA_200", 0), 2) if latest.get("SMA_200") else None,
+        "rsi_14": round(latest.get("RSI_14", 0), 2) if latest.get("RSI_14") else None,
+        "macd": round(latest.get("MACD_12_26_9", 0), 4) if latest.get("MACD_12_26_9") else None,
+        "macd_histogram": round(latest.get("MACDh_12_26_9", 0), 4) if latest.get("MACDh_12_26_9") else None,
+        "bb_upper": round(latest.get("BBU_20_2", 0), 2) if latest.get("BBU_20_2") else None,
+        "bb_lower": round(latest.get("BBL_20_2", 0), 2) if latest.get("BBL_20_2") else None,
+        "atr_14": round(latest.get("ATR_14", 0), 2) if latest.get("ATR_14") else None,
+    }
+```
+
+---
+
+## `data_fetcher/fundamentals.py`
+
+### `get_fundamental_summary`
+
+Extracts key financial ratios from yfinance's `.info` dict and formats them for LLM consumption.
+
+```python
+get_fundamental_summary(ticker_symbol: str, yf_ticker=None) -> dict
+```
+
+### Parameters
+
+<ParamField path="ticker_symbol" type="str" required>
+  The stock symbol (e.g. `"AAPL"`). Used as a fallback to create a new `yf.Ticker` object if `yf_ticker` is not provided.
+</ParamField>
+
+<ParamField path="yf_ticker" type="yf.Ticker" default="None">
+  A pre-instantiated `yf.Ticker` object. Pass the same object used in `fetch_data` to avoid a second network round-trip to yfinance for the same ticker.
+</ParamField>
+
+### Returns
+
+A flat dict with display-friendly keys. Percentage fields (ROE, margins, growth rates) are formatted as `"12.34%"` strings. Market cap is formatted as `"$1,234,567,890"`. Fields with no data from yfinance return `"N/A"`.
+
+```python
+{
+    "P/E":            24.5,
+    "Forward P/E":    21.3,
+    "PEG":            1.82,
+    "P/S":            7.21,
+    "P/B":            44.51,
+    "Dividend %":     "0.52%",
+    "ROE":            "147.25%",
+    "ROA":            "29.11%",
+    "Debt/Eq":        174.1,
+    "Gross Margin":   "45.96%",
+    "Oper. Margin":   "31.51%",
+    "Profit Margin":  "25.31%",
+    "EPS (ttm)":      6.42,
+    "EPS Forward":    7.28,
+    "Revenue Growth": "6.07%",
+    "Earnings Growth":"10.44%",
+    "Market Cap":     "$2,987,000,000,000",
+    "52W High":       199.62,
+    "52W Low":        164.08,
+    "Beta":           1.24,
+}
+```
+
+### Error handling
+
+If `.info` returns fewer than 5 keys (yfinance API failure or delisted ticker), the function returns `{"error": "No se pudieron obtener fundamentales para {ticker}"}`. Any unhandled exception returns `{"error": "Error obteniendo fundamentales de {ticker}: {message}"}`.
+
+### Limitations
+
+- Data freshness depends on yfinance cache — typically 24-hour staleness.
+- Some fields (e.g. `PEG`, `earningsGrowth`) are frequently `"N/A"` for smaller companies.
+- yfinance does not guarantee the same key names across releases; field mapping is defined in the `keys_map` dict in the source.
+
+### Source
+
+```python
+def get_fundamental_summary(ticker_symbol: str, yf_ticker=None) -> dict:
+    """
+    Extrae los ratios fundamentales clave usando yfinance.
+    Acepta un objeto yf.Ticker pre-descargado para evitar llamadas duplicadas.
+    """
+    try:
+        ticker = yf_ticker if yf_ticker else yf.Ticker(ticker_symbol)
+        info = ticker.info
+
+        if not info or len(info) < 5:
+            return {"error": f"No se pudieron obtener fundamentales para {ticker_symbol}"}
+
+        keys_map = {
+            "P/E": "trailingPE",
+            "Forward P/E": "forwardPE",
+            "PEG": "pegRatio",
+            "P/S": "priceToSalesTrailing12Months",
+            "P/B": "priceToBook",
+            "Dividend %": "dividendYield",
+            "ROE": "returnOnEquity",
+            "ROA": "returnOnAssets",
+            "Debt/Eq": "debtToEquity",
+            "Gross Margin": "grossMargins",
+            "Oper. Margin": "operatingMargins",
+            "Profit Margin": "profitMargins",
+            "EPS (ttm)": "trailingEps",
+            "EPS Forward": "forwardEps",
+            "Revenue Growth": "revenueGrowth",
+            "Earnings Growth": "earningsGrowth",
+            "Market Cap": "marketCap",
+            "52W High": "fiftyTwoWeekHigh",
+            "52W Low": "fiftyTwoWeekLow",
+            "Beta": "beta",
+        }
+
+        filtered_data = {}
+        for display_name, yf_key in keys_map.items():
+            value = info.get(yf_key)
+            if value is not None:
+                if yf_key in ("dividendYield", "returnOnEquity", "returnOnAssets",
+                              "grossMargins", "operatingMargins", "profitMargins",
+                              "revenueGrowth", "earningsGrowth"):
+                    filtered_data[display_name] = f"{value:.2%}"
+                elif yf_key == "marketCap":
+                    filtered_data[display_name] = f"${value:,.0f}"
+                else:
+                    filtered_data[display_name] = round(value, 4) if isinstance(value, float) else value
+            else:
+                filtered_data[display_name] = "N/A"
+
+        return filtered_data
+
+    except Exception as e:
+        return {"error": f"Error obteniendo fundamentales de {ticker_symbol}: {str(e)}"}
+```
+
+---
+
+## `data_fetcher/news.py`
+
+### `get_newsapi_news`
+
+Fetches recent news headlines for a ticker from the NewsAPI `/v2/everything` endpoint.
+
+```python
+get_newsapi_news(ticker: str, days_back: int = 3) -> list
+```
+
+The query searches for the ticker symbol across a curated list of financial and neutral news sources: Reuters, Associated Press, Bloomberg, WSJ, Fortune, Financial Post, Washington Post, BBC News, Axios, and Politico.
+
+### Authentication
+
+Requires the `NEWSAPI_KEY` environment variable (read via `python-dotenv`). If the key is missing, the function immediately returns `[{"error": "Falta NEWSAPI_KEY en las variables de entorno."}]`.
+
+### Parameters
+
+<ParamField path="ticker" type="str" required>
+  The stock ticker symbol to search for. Wrapped in quotes in the query string: `'"AAPL" AND ("stock market" OR markets OR shares OR earnings OR sentiment)'`.
+</ParamField>
+
+<ParamField path="days_back" type="int" default="3">
+  Number of days to look back for news. Defaults to `3`, matching `NEWS_DAYS_BACK` in `config.py`. Increasing this value may surface stale narratives.
+</ParamField>
+
+### Returns
+
+A list of article dicts. Up to 10 articles are returned, sorted by relevance.
+
+```python
+[
+    {
+        "date":     "2026-03-28",
+        "time":     "14:32:00",
+        "headline": "Apple reports record iPhone sales in Q1",
+        "source":   "Reuters",
+        "link":     "https://reuters.com/..."
+    },
+    ...
+]
+```
+
+<ResponseField name="date" type="str">Publication date in `"YYYY-MM-DD"` format.</ResponseField>
+<ResponseField name="time" type="str">Publication time in `"HH:MM:SS"` format (UTC).</ResponseField>
+<ResponseField name="headline" type="str">Article title.</ResponseField>
+<ResponseField name="source" type="str">Publisher name.</ResponseField>
+<ResponseField name="link" type="str">Full article URL.</ResponseField>
+
+### Fallback behavior
+
+If the initial request with `sources` filtering returns no articles, the function retries without the `sources` parameter to broaden the search. This handles tickers that have limited coverage in the curated source list.
+
+### Rate limits and error handling
+
+| Condition | Behavior |
+|---|---|
+| `NEWSAPI_KEY` not set | Returns `[{"error": "Falta NEWSAPI_KEY..."}]` immediately |
+| HTTP status != 200 | Returns `[{"error": "NewsAPI error ({status}): {message}"}]` |
+| `status != "ok"` in JSON | Returns `[{"error": "NewsAPI error interno: {message}"}]` |
+| `requests` exception | Returns `[{"error": "Excepción de Requests: {message}"}]` |
+
+<Warning>
+  The free tier of NewsAPI limits requests to 100/day and restricts results to the past 30 days. Use a paid plan in production to avoid `426 Upgrade Required` errors when the daily limit is hit.
+</Warning>
+
+### Source
+
+```python
+def get_newsapi_news(ticker: str, days_back: int = 3) -> list:
+    """
+    Extrae los titulares de noticias recientes para un ticker usando NewsAPI,
+    limitado a un rango de días para evitar el sesgo de noticias antiguas.
+    """
+    api_key = os.getenv("NEWSAPI_KEY")
+    if not api_key:
+        return [{"error": "Falta NEWSAPI_KEY en las variables de entorno."}]
+
+    end_date = datetime.now()
+    start_date = end_date - timedelta(days=days_back)
+
+    url = "https://newsapi.org/v2/everything"
+    consulta = f'"{ticker}" AND ("stock market" OR markets OR shares OR earnings OR sentiment)'
+    fuentes_neutrales = "reuters,associated-press"
+    fuentes_negocios = "bloomberg,the-wall-street-journal,fortune,financial-post"
+    fuentes_politico_economico = "the-washington-post,bbc-news,axios,politico"
+    fuentes_todas = f"{fuentes_neutrales},{fuentes_negocios},{fuentes_politico_economico}"
+
+    params = {
+        "q": consulta,
+        "from": start_date.strftime("%Y-%m-%d"),
+        "to": end_date.strftime("%Y-%m-%d"),
+        "pageSize": 10,
+        "sortBy": "relevancy",
+        "sources": fuentes_todas,
+        "apiKey": api_key
+    }
+
+    try:
+        resp = requests.get(url, params=params, timeout=10)
+        if resp.status_code != 200:
+            err_msg = resp.json().get("message", resp.text) if resp.text else "Error desconocido"
+            return [{"error": f"NewsAPI error ({resp.status_code}): {err_msg}"}]
+
+        data = resp.json()
+        if data.get("status") != "ok":
+            return [{"error": f"NewsAPI error interno: {data.get('message')}"}]
+
+        articles = data.get("articles", [])
+        if not articles:
+            params.pop('sources')
+            resp = requests.get(url, params=params, timeout=10)
+            if resp.status_code == 200:
+                data = resp.json()
+                articles = data.get("articles", [])
+
+        news_list = []
+        for a in articles:
+            pub_date = a.get("publishedAt", "")
+            if pub_date:
+                parts = pub_date.split("T")
+                c_date = parts[0]
+                c_time = parts[1].replace("Z", "") if len(parts) > 1 else ""
+            else:
+                c_date, c_time = "", ""
+
+            news_list.append({
+                "date": c_date,
+                "time": c_time,
+                "headline": a.get("title", ""),
+                "source": a.get("source", {}).get("name", "N/A"),
+                "link": a.get("url", "")
+            })
+
+        return news_list
+
+    except Exception as e:
+        return [{"error": f"Excepción de Requests: {str(e)}"}]
+```
+
+---
+
+## How fetchers are called in `agents/graph.py`
+
+The `fetch_data` node in `agents/graph.py` calls all three fetchers for each ticker before the parallel filter agents run:
+
+```python
+def fetch_data(state: TickerState) -> dict:
+    """Descarga datos de yfinance (una sola conexión) y NewsAPI."""
+    ticker = state["ticker"]
+
+    # Single yfinance object — reused for both technical and fundamental data
+    yf_ticker = yf.Ticker(ticker)
+
+    try:
+        price_df = yf_ticker.history(period="6mo")
+    except Exception as e:
+        price_df = None
+
+    # Technical indicators (requires price_df)
+    if price_df is not None and not price_df.empty:
+        tech_data = get_latest_technical_summary(price_df.copy())
+    else:
+        tech_data = {}
+
+    # Fundamental ratios (reuses the same yf_ticker object)
+    fund_data = get_fundamental_summary(ticker, yf_ticker=yf_ticker)
+
+    # News headlines (independent HTTP request to NewsAPI)
+    news_data = get_newsapi_news(ticker, days_back=3)
+
+    return {
+        "tech_data": tech_data,
+        "fund_data": fund_data,
+        "news_data": news_data,
+        "timings": timings,
+    }
+```
+
+After `fetch_data` completes, the LangGraph fan-out sends the state to three parallel filter agents (`filter_technical`, `filter_fundamental`, `filter_news`), each of which summarizes its respective data section using an LLM before the `generate_arguments` node synthesizes a final argument list.
+
+<Tip>
+  The `yf.Ticker` object is instantiated once and passed to both `get_latest_technical_summary` (via `price_df`) and `get_fundamental_summary` (via `yf_ticker=`). This reduces network calls from 2 to 1 per ticker for yfinance data.
+</Tip>

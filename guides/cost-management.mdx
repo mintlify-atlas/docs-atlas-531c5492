@@ -1,0 +1,162 @@
+---
+title: 'Cost management'
+description: 'Understand the API cost drivers in MEME and practical strategies to control spending during development and production.'
+---
+
+## Cost drivers
+
+Every pipeline run incurs costs from three sources: OpenAI LLM calls, OpenAI embeddings, and NewsAPI requests.
+
+### OpenAI LLM calls
+
+Each ticker in the active universe triggers four LLM calls through the LangGraph agent graph:
+
+| Agent | Model | Count per ticker | Purpose |
+|---|---|---|---|
+| `filter_tech` | `gpt-4o-mini` | 1 | Summarizes technical indicator data |
+| `filter_fund` | `gpt-4o-mini` | 1 | Summarizes fundamental metrics |
+| `filter_news` | `gpt-4o-mini` | 1 | Summarizes news articles |
+| `generate_arguments` | `gpt-4o` | 1 | Synthesizes summaries into structured investment arguments |
+
+The three filter agents run in parallel within the LangGraph graph. The generator agent runs after all three complete.
+
+```python
+# config.py
+LLM_FILTER_MODEL = "gpt-4o-mini"   # 3 calls per ticker
+LLM_EXTRACTOR_MODEL = "gpt-4o"     # 1 call per ticker
+```
+
+The generator agent (`gpt-4o`) is the dominant cost driver because it processes longer inputs (the concatenated summaries from all three filter agents) and uses a more expensive model.
+
+### OpenAI embeddings
+
+After Phase 1 completes, every valid investment argument is embedded using:
+
+```python
+# config.py
+EMBEDDING_MODEL = "text-embedding-3-small"
+```
+
+The number of embedding calls equals the total number of valid arguments across all tickers. Typically each ticker produces 1–3 arguments, so for a 10-ticker run you can expect 10–30 embedding calls. `text-embedding-3-small` is priced per token and is significantly cheaper than the LLM calls.
+
+### NewsAPI requests
+
+Each ticker consumes exactly one NewsAPI request per run. The request fetches news articles from the last `NEWS_DAYS_BACK` days:
+
+```python
+# config.py
+NEWS_DAYS_BACK = 3
+```
+
+On the free tier, NewsAPI allows **100 requests per day**. There is no per-request cost on free or paid plans — the cost is either zero (free tier) or a flat monthly subscription.
+
+---
+
+## Estimated token usage per ticker
+
+The following are rough order-of-magnitude estimates. Actual usage varies with news article length, fundamental data size, and technical indicator count.
+
+| Component | Approx. input tokens | Approx. output tokens |
+|---|---|---|
+| `filter_tech` (gpt-4o-mini) | 500–1,500 | 200–400 |
+| `filter_fund` (gpt-4o-mini) | 500–1,500 | 200–400 |
+| `filter_news` (gpt-4o-mini) | 1,000–4,000 | 300–600 |
+| `generate_arguments` (gpt-4o) | 800–2,500 | 300–800 |
+| Embeddings (text-embedding-3-small) | 100–400 per argument | — |
+
+For a 10-ticker run, expect roughly 25,000–80,000 total tokens consumed across all calls.
+
+---
+
+## Cost reduction strategies
+
+### 1. Keep ACTIVE_UNIVERSE_LIMIT low during development
+
+The single most impactful lever is universe size. All costs scale linearly with the number of tickers processed.
+
+```python
+# config.py
+ACTIVE_UNIVERSE_LIMIT = 10  # default — safe for testing
+```
+
+Start at 10 and increase only when you are ready to move toward a production deployment.
+
+### 2. Switch the generator to gpt-4o-mini
+
+The generator agent (`LLM_EXTRACTOR_MODEL`) defaults to `gpt-4o`. Switching it to `gpt-4o-mini` reduces the cost of the most expensive per-ticker call by roughly 15–25×, at the expense of argument quality.
+
+```python
+# config.py
+LLM_EXTRACTOR_MODEL = "gpt-4o-mini"  # cheaper, lower quality
+```
+
+<Tip>
+  During initial development and backtesting, `gpt-4o-mini` for the generator is often sufficient to verify that the pipeline is wired correctly. Switch back to `gpt-4o` when you are evaluating signal quality.
+</Tip>
+
+### 3. Keep NEWS_DAYS_BACK at the default
+
+A larger `NEWS_DAYS_BACK` value means longer news payloads sent to the `filter_news` agent, increasing its token consumption. The default of 3 days is a reasonable balance between signal recency and cost.
+
+```python
+# config.py
+NEWS_DAYS_BACK = 3  # increase only if recency of news signal warrants it
+```
+
+Increasing this to 7 or 14 days will increase the input token count for `filter_news` proportionally, since more articles are included.
+
+### 4. Use a free or open-source embedding model
+
+`text-embedding-3-small` is already one of the cheapest OpenAI embedding models, but you can eliminate this cost entirely by swapping in a local embedding model (e.g., a sentence-transformers model running on CPU). The interface in `clustering/embeddings.py` accepts any function that returns a list of float vectors, so the substitution is localized to that module.
+
+<Note>
+  Switching embedding models changes the vector space in which narratives are clustered. If you swap models mid-history, the GMM centroids stored in the database will no longer be comparable to new centroids, breaking the temporal alignment step. Either clear the database or treat the switch as a fresh start.
+</Note>
+
+---
+
+## NewsAPI tier comparison
+
+| Plan | Requests/day | Historical depth | Cost |
+|---|---|---|---|
+| Free | 100 | 1 month | $0 |
+| Developer | Unlimited | 5 years | $449/month |
+
+For a universe of up to 100 tickers, the free tier is sufficient. For larger universes or if you need more than 1 month of historical article retrieval for `NEWS_DAYS_BACK`, you need the Developer plan.
+
+---
+
+## Soft rate limiting between tickers
+
+The ticker loop includes a 1-second sleep after each ticker:
+
+```python
+# main.py
+for t in universe:
+    try:
+        args = run_phase1_for_ticker(t)
+        master_arguments_list.extend(args)
+        time.sleep(1)  # Rate limit suave
+    except Exception as e:
+        print(f"[ERROR] {t}: {e}")
+        continue
+```
+
+This sleep serves as a basic courtesy delay between API calls. It does not meaningfully reduce total token usage or cost, but it reduces the risk of hitting OpenAI's per-minute rate limits on lower-tier API keys, which could cause retries and wasted calls.
+
+---
+
+## Running the full S&P 500
+
+<Warning>
+  Processing all ~503 S&P 500 tickers in a single daily run will exceed the NewsAPI free tier limit (503 requests vs. 100 allowed), and will generate an estimated **$30–$80+ per day** in OpenAI charges depending on current model pricing and article lengths. Running this configuration for a full month would produce a bill of approximately $900–$2,400 from OpenAI alone, plus a $449/month NewsAPI Developer plan.
+
+  Do not increase `ACTIVE_UNIVERSE_LIMIT` to 503 without a paid NewsAPI plan, explicit OpenAI spend limits configured in your account dashboard, and a clear understanding of your expected daily costs.
+</Warning>
+
+If you intend to scale toward the full S&P 500, the recommended approach is:
+
+1. Set an [OpenAI usage limit](https://platform.openai.com/account/limits) to cap daily spend.
+2. Upgrade to the NewsAPI Developer plan.
+3. Increase `ACTIVE_UNIVERSE_LIMIT` incrementally (e.g., 50 → 100 → 200 → 503), monitoring actual token usage in the OpenAI dashboard at each step.
+4. Consider replacing `gpt-4o` with `gpt-4o-mini` for `LLM_EXTRACTOR_MODEL` to reduce the per-ticker cost at scale.

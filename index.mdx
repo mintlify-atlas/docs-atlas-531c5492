@@ -1,97 +1,64 @@
 ---
-title: "Introduction"
-description: "Welcome to the new home for your documentation"
+title: "MEME: Modeling the Evolutionary Modes of Financial Markets"
+description: "A Logic-Oriented AI system that identifies latent market narratives using LLM agents, Gaussian Mixture Models, and EMA momentum to construct dual long/short portfolios for S&P 500 stocks in real time."
 ---
 
-## Setting up
+MEME is a research implementation of the [Logic-Oriented paradigm](https://arxiv.org/abs/2602.11918) for quantitative trading. Instead of predicting returns from raw numerical data, it extracts the **underlying reasoning** that drives market prices — transforming multimodal data (technicals, fundamentals, news) into structured investment arguments, clustering them into latent narratives, and ranking stocks by the historical profitability of their dominant stories.
 
-Get your documentation site up and running in minutes.
-
-<Card
-  title="Start here"
-  icon="rocket"
-  href="/quickstart"
-  horizontal
->
-  Follow our three step quickstart guide.
-</Card>
-
-## Make it yours
-
-Design a docs site that looks great and empowers your users.
-
-<Columns cols={2}>
-  <Card
-    title="Edit locally"
-    icon="pen-to-square"
-    href="/development"
-  >
-    Edit your docs locally and preview them in real time.
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Set up your environment and run the full pipeline in minutes.
   </Card>
-  <Card
-    title="Customize your site"
-    icon="palette"
-    href="/essentials/settings"
-  >
-    Customize the design and colors of your site to match your brand.
+  <Card title="How MEME works" icon="brain" href="/concepts/meme-system">
+    Understand the three-phase Logic-Oriented methodology.
   </Card>
-    <Card
-    title="Set up navigation"
-    icon="map"
-    href="/essentials/navigation"
-  >
-    Organize your docs to help users find what they need and succeed with your product.
+  <Card title="Configuration reference" icon="sliders" href="/configuration/parameters">
+    Tune universe size, cluster count, portfolio percentiles, and more.
   </Card>
-  <Card
-    title="API documentation"
-    icon="terminal"
-    href="/api-reference/introduction"
-  >
-    Auto-generate API documentation from OpenAPI specifications.
+  <Card title="Module reference" icon="code" href="/reference/agents/graph">
+    Explore every module — agents, clustering, evaluation, and portfolio.
   </Card>
-</Columns>
+</CardGroup>
 
-## Create beautiful pages
+## How it works
 
-Everything you need to create world-class documentation.
+MEME runs a three-phase pipeline each trading day after market close:
 
-<Columns cols={2}>
-  <Card
-    title="Write with MDX"
-    icon="pen-fancy"
-    href="/essentials/markdown"
-  >
-    Use MDX to style your docs pages.
-  </Card>
-  <Card
-    title="Code samples"
-    icon="code"
-    href="/essentials/code"
-  >
-    Add sample code to demonstrate how to use your product.
-  </Card>
-  <Card
-    title="Images"
-    icon="image"
-    href="/essentials/images"
-  >
-    Display images and other media.
-  </Card>
-  <Card
-    title="Reusable snippets"
-    icon="recycle"
-    href="/essentials/reusable-snippets"
-  >
-    Write once and reuse across your docs.
-  </Card>
-</Columns>
+<Steps>
+  <Step title="Phase 1 — Argument extraction">
+    A LangGraph agent graph fetches technical, fundamental, and news data for each ticker concurrently, then synthesizes it into structured **Investment Arguments**: a directional polarity (+1 bullish / −1 bearish), an analytical justification, and supporting evidence.
+  </Step>
+  <Step title="Phase 2 — Mode identification">
+    Arguments are embedded with OpenAI `text-embedding-3-small` and clustered into **K Thinking Modes** using a Gaussian Mixture Model. A Hungarian algorithm aligns today's modes with yesterday's to track narrative continuity across time.
+  </Step>
+  <Step title="Phase 3 — Portfolio construction">
+    Real close-to-close returns are measured for each mode. An EMA filter smooths profitability over time. A composite signal — `Σ(GMM probability × polarity × EMA momentum)` — scores every ticker, and the top/bottom 20% form the **Long** and **Short** portfolios with equal weighting.
+  </Step>
+</Steps>
 
-## Need inspiration?
+## Key capabilities
 
-<Card
-  title="See complete examples"
-  icon="stars"
-  href="https://mintlify.com/customers"
->
-  Browse our showcase of exceptional documentation sites.
-</Card>
+<CardGroup cols={2}>
+  <Card title="LangGraph parallel agents" icon="diagram-project">
+    Technical, fundamental, and news filtering agents run concurrently via fan-out/fan-in for efficient per-ticker processing.
+  </Card>
+  <Card title="Gaussian Mixture Models" icon="chart-scatter">
+    Soft clustering (K=15–20 components) captures overlapping market narratives — unlike hard k-means assignment.
+  </Card>
+  <Card title="Temporal alignment" icon="arrows-rotate">
+    The Hungarian algorithm tracks narrative identity across consecutive days, preventing semantic drift in mode IDs.
+  </Card>
+  <Card title="Dual long/short portfolio" icon="scale-balanced">
+    Goes beyond long-only: the bottom 20% of narratives drives short positions, testing whether bearish logic destroys value.
+  </Card>
+  <Card title="Defensive cash mode" icon="shield">
+    If no narratives have positive EMA momentum, the system holds cash rather than forcing positions into a hostile market.
+  </Card>
+  <Card title="SQLite persistence" icon="database">
+    Every argument, centroid, EMA value, and portfolio position is stored incrementally — enabling multi-week momentum tracking.
+  </Card>
+</CardGroup>
+
+<Note>
+  **Academic research tool** — MEME does not constitute financial advice or investment recommendations. It is designed to evaluate the MEME system presented in [arXiv:2602.11918](https://arxiv.org/abs/2602.11918) in real-time forward-testing mode.
+</Note>

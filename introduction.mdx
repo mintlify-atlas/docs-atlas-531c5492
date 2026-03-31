@@ -1,0 +1,80 @@
+---
+title: "Introduction"
+description: "What MEME is, where it comes from, and how it differs from classical quantitative trading approaches."
+---
+
+## What is MEME?
+
+MEME (Modeling the Evolutionary Modes of Financial Markets) is a research implementation of a **Logic-Oriented paradigm** for quantitative trading. Rather than predicting returns by fitting patterns in raw numerical data — prices, volumes, financial ratios — it asks a different question: *what reasoning is actually moving these prices?*
+
+The system extracts structured **Investment Arguments** from multimodal market data, clusters them into latent **Thinking Modes** (recurring market narratives), and ranks stocks by the historical profitability of the narratives they belong to. The output is a daily dual long/short portfolio for the S&P 500.
+
+### Logic-Oriented vs. Object-Oriented
+
+Classical quantitative models operate in an **Object-Oriented** frame: they treat market data as objects — numbers, tensors, time series — and use statistical or deep-learning methods to map those objects to predicted returns. The signal is entirely implicit in the parameters learned during training.
+
+The **Logic-Oriented** approach inverts this. LLM agents read the same data sources (fundamentals, technicals, news) and produce *explicit reasoning*: a directional polarity (bullish or bearish), an analytical justification, and supporting evidence. These arguments are then embedded and clustered so the system can track which *types of reasoning* tend to be profitable over time.
+
+This shift matters because market regimes change. A narrative that predicted returns during a rate-hiking cycle may not survive a liquidity crisis. By modeling the logic rather than the numbers, MEME can track when a story is working and when it has stopped.
+
+---
+
+## Research background
+
+This project is an implementation of the methodology introduced in:
+
+> **MEME: Modeling the Evolutionary Modes of Financial Markets**
+> arXiv:2602.11918 — [https://arxiv.org/abs/2602.11918](https://arxiv.org/abs/2602.11918)
+
+The original research validated MEME against a comprehensive set of baselines on Chinese equity markets (CSI 300 / SSE 50), including classical ML models (LightGBM), deep factor models (FactorVAE, MASTER), and modern LLM-based agent frameworks (TradingAgents, R&D-Agent).
+
+### Original research results (CSI 300)
+
+| Metric | Value |
+|---|---|
+| Annualized return | 32.48% |
+| Sharpe ratio | 1.5161 |
+| Max drawdown | 10.76% |
+| ICIR (IC Information Ratio) | > 41.71% |
+
+The paper also demonstrated robustness across market regimes: MEME maintained statistical superiority even during out-of-sample tests in Q4 2025, a period outside the pre-training knowledge window of the underlying LLM — ruling out memorization as an explanation for performance.
+
+---
+
+## How this implementation differs from the paper
+
+The original paper describes MEME as a research framework validated on historical Chinese equity data. This implementation adapts it for **live forward-testing on the S&P 500** with several architectural changes:
+
+**LangGraph parallel agents.** The paper's sequential data-processing pipeline is replaced with a `LangGraph` fan-out/fan-in graph. Technical, fundamental, and news filtering agents run concurrently per ticker, reducing per-ticker latency and making the pipeline practical for daily live runs.
+
+**SQLite persistence.** All arguments, embeddings, GMM centroids, and EMA momentum values are stored in a local `meme_history.db` after each run. This allows the Hungarian alignment algorithm and EMA weights to recover memory across days without reprocessing historical data.
+
+**Dual long/short portfolio.** The original paper focuses on long-only strategies. This implementation adds a symmetric short branch: the bottom 20% of tickers by composite signal are candidates for short positions, testing whether bearish narratives destroy value as symmetrically as bullish ones create it.
+
+**S&P 500 / US market adaptation.** The universe is the live S&P 500 list fetched from Wikipedia at runtime. News is sourced via NewsAPI; price and fundamental data via `yfinance`. The system handles US market holidays and weekend gaps in the return calculation.
+
+**Defensive cash mode.** If no narrative has positive EMA momentum at signal time, the system skips portfolio construction entirely. This "cash is king" layer is not present in the original paper but is a natural extension of the logic-driven design.
+
+---
+
+## Academic disclaimer
+
+<Warning>
+  MEME is an **academic research tool** designed to evaluate the methodology of [arXiv:2602.11918](https://arxiv.org/abs/2602.11918) in real-time forward-testing mode. It does not constitute financial advice or an investment recommendation under any circumstances. No part of this system, its outputs, or this documentation should be interpreted as guidance for real capital allocation.
+</Warning>
+
+---
+
+## Where to go next
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Set up your environment and run the full pipeline for the first time.
+  </Card>
+  <Card title="How MEME works" icon="brain" href="/concepts/meme-system">
+    Detailed walkthrough of all three pipeline phases.
+  </Card>
+  <Card title="Configuration reference" icon="sliders" href="/configuration/parameters">
+    Tune universe size, cluster count, portfolio percentiles, and more.
+  </Card>
+</CardGroup>

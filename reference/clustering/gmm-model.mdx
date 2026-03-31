@@ -1,0 +1,199 @@
+---
+title: GMM model
+description: ModeIdentifierGMM wraps scikit-learn's GaussianMixture to discover K latent narrative modes from daily argument embeddings.
+---
+
+`ModeIdentifierGMM` is the core clustering model in MEME's Phase 2. It fits a Gaussian Mixture Model over the embedding matrix produced by the [embeddings module](/reference/clustering/embeddings), then exposes the posterior probabilities (ω), cluster means (µ), and covariance matrices (Σ) that drive downstream portfolio construction.
+
+## Class overview
+
+```python
+from clustering.gmm_model import ModeIdentifierGMM
+```
+
+Internally, the class wraps `sklearn.mixture.GaussianMixture` with a fixed configuration:
+
+| sklearn parameter | Value |
+|---|---|
+| `covariance_type` | `'full'` — each cluster has its own unconstrained covariance matrix |
+| `random_state` | `42` — reproducible results across runs |
+| `n_components` | configured via `K_CLUSTERS` in `config.py` |
+
+## K selection
+
+The number of clusters K is not arbitrary. MEME follows the empirical scaling rule from the base paper:
+
+```python
+# config.py
+K_CLUSTERS = 15 if ACTIVE_UNIVERSE_LIMIT <= 50 else 20
+```
+
+| Universe size | K |
+|---|---|
+| ≤ 50 stocks (e.g. SSE 50) | 15 |
+| > 50 stocks (e.g. CSI 300/500) | 20 |
+
+The default argument in `__init__` is set to `15`, matching the smaller-universe default. In `main.py`, the pipeline reads `K_CLUSTERS` from config and passes it explicitly:
+
+```python
+gmm_model = ModeIdentifierGMM(n_components=k)
+```
+
+---
+
+## Methods
+
+### `__init__`
+
+```python
+def __init__(self, n_components: int = 15):
+```
+
+Initializes the internal `GaussianMixture` object. No data is required at this stage.
+
+<ParamField path="n_components" type="int" default="15">
+  The number of Gaussian mixture components K — i.e., the number of latent narrative modes MEME will discover. Use `K_CLUSTERS` from `config.py` to stay aligned with the paper's empirical scaling rule.
+</ParamField>
+
+---
+
+### `fit`
+
+```python
+def fit(self, embeddings: np.ndarray):
+```
+
+Trains the GMM on today's full set of argument embeddings. This is a standard EM (Expectation-Maximization) fit; the model learns the means µ, covariance matrices Σ, and mixing weights π for each of the K components.
+
+<ParamField path="embeddings" type="np.ndarray" required>
+  A 2-D array of shape **(N, D)**, where N is the total number of valid arguments collected across all tickers today and D is the embedding dimensionality (1,536 for `text-embedding-3-small`).
+</ParamField>
+
+<Warning>
+  If `N < K` (fewer arguments than components), the model will print an attention message and may overfit or fail to converge. In `main.py` this is guarded by falling back to a smaller K:
+
+  ```python
+  k = K_CLUSTERS if len(valid_arguments) >= K_CLUSTERS else min(3, len(valid_arguments))
+  ```
+</Warning>
+
+---
+
+### `get_posteriors`
+
+```python
+def get_posteriors(self, embeddings: np.ndarray) -> np.ndarray:
+```
+
+Returns the **ω matrix** — the posterior probability that each argument belongs to each narrative mode.
+
+<ParamField path="embeddings" type="np.ndarray" required>
+  The same embedding matrix passed to `fit`, shape **(N, D)**. You can also pass a new set of embeddings to score unseen arguments.
+</ParamField>
+
+<ResponseField name="omega" type="np.ndarray">
+  A matrix of shape **(N, K)**. Each row sums to 1.0 and represents a probability distribution over K narrative modes for that argument. Element `ω[i, k]` is the probability that argument `i` belongs to mode `k`.
+
+  In `main.py`, the dominant cluster for display purposes is:
+
+  ```python
+  top_cluster = np.argmax(posteriors[idx])
+  prob_score  = posteriors[idx][top_cluster]
+  ```
+</ResponseField>
+
+<Tip>
+  The full ω matrix — not just the argmax assignment — is used downstream in portfolio scoring. Soft assignments let each argument contribute fractionally to multiple narrative modes, capturing ambiguous market signals more faithfully than hard clustering.
+</Tip>
+
+---
+
+### `get_centroids`
+
+```python
+def get_centroids(self) -> np.ndarray:
+```
+
+Returns the learned cluster means µ. Call this only after `fit`.
+
+<ResponseField name="centroids" type="np.ndarray">
+  A matrix of shape **(K, D)** — one centroid vector per narrative mode. These centroids are stored in the database and used the next day by [`align_modes`](/reference/clustering/alignment) to maintain consistent narrative IDs across time.
+</ResponseField>
+
+---
+
+### `get_covariances`
+
+```python
+def get_covariances(self) -> np.ndarray:
+```
+
+Returns the learned covariance matrices Σ. Call this only after `fit`.
+
+<ResponseField name="covariances" type="np.ndarray">
+  An array of shape **(K, D, D)** — one full covariance matrix per narrative mode. With `covariance_type='full'`, each mode can capture its own ellipsoidal spread in embedding space, allowing the model to distinguish narratives that differ in both direction and breadth.
+</ResponseField>
+
+---
+
+## Usage in the pipeline
+
+```python
+# main.py — Phase 2
+
+# Build and fit
+gmm_model = ModeIdentifierGMM(n_components=k)
+gmm_model.fit(embeddings_np)                        # (N, D)
+
+# Extract outputs
+posteriors = gmm_model.get_posteriors(embeddings_np)  # (N, K)
+centroids  = gmm_model.get_centroids()                # (K, D)
+
+# Persist centroids for tomorrow's temporal alignment
+save_daily_run(..., centroids=centroids, ...)
+```
+
+---
+
+## Complete source
+
+```python clustering/gmm_model.py
+import numpy as np
+from sklearn.mixture import GaussianMixture
+
+class ModeIdentifierGMM:
+    def __init__(self, n_components: int = 15):
+        """
+        Inicializa el modelo de Mezcla Gaussiana.
+        K = 15 narrativas (modos de pensamiento) siguiendo el documento base para 50 acciones.
+        """
+        self.n_components = n_components
+        self.gmm = GaussianMixture(n_components=n_components, covariance_type='full', random_state=42)
+        
+    def fit(self, embeddings: np.ndarray):
+        """
+        Entrena el GMM con el conjunto de embeddings de argumentos diarios.
+        """
+        if len(embeddings) < self.n_components:
+            print("Atención: Hay menos argumentos que componentes(K). GMM puede fallar o sobreajustarse severamente.")
+        self.gmm.fit(embeddings)
+        
+    def get_posteriors(self, embeddings: np.ndarray) -> np.ndarray:
+        """
+        Calcula la probabilidad de que cada argumento (fila) pertenezca a cada modo (columna).
+        Retorna la matriz omega (ω).
+        """
+        return self.gmm.predict_proba(embeddings)
+        
+    def get_centroids(self) -> np.ndarray:
+        """
+        Retorna los centros de cada modo (las medias µ de los clústeres gaussianos).
+        """
+        return self.gmm.means_
+        
+    def get_covariances(self) -> np.ndarray:
+        """
+        Retorna las matrices de covarianza de los modos (Σ).
+        """
+        return self.gmm.covariances_
+```

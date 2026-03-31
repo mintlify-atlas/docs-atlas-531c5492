@@ -1,0 +1,149 @@
+---
+title: 'Scaling the stock universe'
+description: 'How to adjust the number of tickers MEME processes per run, and what API and cost constraints apply at each scale.'
+---
+
+## Default configuration
+
+Out of the box, MEME processes 10 tickers per run. This is controlled by a single constant in `config.py`:
+
+```python
+# config.py
+ACTIVE_UNIVERSE_LIMIT = 10
+```
+
+The active universe is then sliced from the full S&P 500 list in `main.py`:
+
+```python
+# main.py
+active_universe = UNIVERSE[:ACTIVE_UNIVERSE_LIMIT]
+```
+
+A limit of 10 is intentionally conservative. It keeps NewsAPI requests well within the free tier, OpenAI token costs predictable, and run times short enough to iterate on during development.
+
+---
+
+## How the ticker list is built
+
+At startup, `main.py` calls `get_sp500_tickers()`, which downloads the current S&P 500 constituent table from Wikipedia:
+
+```python
+# main.py
+def get_sp500_tickers() -> list[str]:
+    """Descarga los tickers del S&P 500 desde Wikipedia."""
+    try:
+        url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                          "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
+        }
+        resp = requests.get(url, headers=headers, timeout=15)
+        resp.raise_for_status()
+        dfs = pd.read_html(StringIO(resp.text))
+        df = dfs[0]
+        tickers = df['Symbol'].str.replace('.', '-', regex=False).tolist()
+        print(f"  ✓ {len(tickers)} tickers obtenidos.")
+        return tickers
+    except Exception as e:
+        print(f"  [Error] No se pudo obtener S&P 500: {e}")
+        print("  Cargando lista de respaldo...")
+        return ["AAPL", "MSFT", "NVDA", "GOOGL", "AMZN", "META", "TSLA", "BRK-B", "LLY", "AVGO"]
+```
+
+This gives you a live, up-to-date list of ~503 tickers. Dots in symbols (e.g., `BRK.B`) are replaced with hyphens (`BRK-B`) to match the format yfinance and NewsAPI expect.
+
+### Fallback list
+
+If Wikipedia is unreachable or returns an unexpected response, the function falls back to a hardcoded list of 10 large-cap tickers:
+
+```python
+return ["AAPL", "MSFT", "NVDA", "GOOGL", "AMZN", "META", "TSLA", "BRK-B", "LLY", "AVGO"]
+```
+
+The pipeline continues normally with this fallback. `ACTIVE_UNIVERSE_LIMIT` still applies — if it is set to 5, only the first 5 fallback tickers are used.
+
+---
+
+## How K_CLUSTERS scales with universe size
+
+The number of GMM clusters automatically adjusts based on `ACTIVE_UNIVERSE_LIMIT`:
+
+```python
+# config.py
+K_CLUSTERS = 15 if ACTIVE_UNIVERSE_LIMIT <= 50 else 20
+```
+
+This mirrors the empirical scaling from the original MEME paper, which used K=15 for smaller indices (SSE 50) and K=20 for larger ones (CSI 300/500). You do not need to change `K_CLUSTERS` manually when you adjust `ACTIVE_UNIVERSE_LIMIT` — it recalculates at import time.
+
+<Note>
+  During Phase 2, the pipeline also guards against the case where the number of valid arguments is smaller than K. It will reduce K to `min(3, len(valid_arguments))` to prevent GMM from failing:
+
+  ```python
+  # main.py
+  k = K_CLUSTERS if len(valid_arguments) >= K_CLUSTERS else min(3, len(valid_arguments))
+  ```
+</Note>
+
+---
+
+## API constraints by universe size
+
+### NewsAPI
+
+Each ticker consumes exactly one NewsAPI request per run (to fetch the last `NEWS_DAYS_BACK` days of news). The free tier allows **100 requests per day**.
+
+| Universe size | NewsAPI requests/day | Free tier safe? |
+|---|---|---|
+| ≤ 10 | 10 | Yes |
+| ≤ 50 | 50 | Yes |
+| ≤ 100 | 100 | Yes (at the limit) |
+| > 100 | > 100 | No — HTTP 426/429 errors |
+
+Tickers beyond request 100 will fail their news fetch. The pipeline catches this error per-ticker and continues, but those arguments will have no news signal.
+
+### OpenAI
+
+Each ticker drives multiple LLM calls:
+- **3 filter agents** (`gpt-4o-mini`) — one each for technical, fundamental, and news data.
+- **1 generator agent** (`gpt-4o`) — synthesizes the filtered summaries into investment arguments.
+
+Additionally, every valid argument is converted to an embedding using `text-embedding-3-small`.
+
+OpenAI costs scale linearly with universe size. There is no hard limit, only a billing one.
+
+---
+
+## Universe size recommendations
+
+<Warning>
+  Running the full S&P 500 (~503 tickers) daily will exceed the NewsAPI free tier and generate a material OpenAI bill. Do not increase `ACTIVE_UNIVERSE_LIMIT` beyond 100 without a paid NewsAPI plan and a clear understanding of your expected daily token spend.
+</Warning>
+
+| Universe size | NewsAPI tier needed | Estimated daily OpenAI cost | K_CLUSTERS | Use case |
+|---|---|---|---|---|
+| 10 | Free | < $1 | 15 | Development, testing |
+| 50 | Free | $3–$8 | 15 | Pilot / paper trading |
+| 100 | Free (at limit) | $6–$16 | 15 | Small live deployment |
+| 200 | Developer ($449/mo) | $12–$32 | 20 | Medium deployment |
+| 503 (full S&P 500) | Developer ($449/mo) | $30–$80+ | 20 | Full research replication |
+
+<Tip>
+  Cost estimates above assume average news article length and typical OpenAI pricing as of early 2025. Your actual costs will vary based on article length, model pricing changes, and how many filter agents return non-empty summaries.
+</Tip>
+
+---
+
+## Replacing NewsAPI with an alternative data source
+
+The news fetch happens inside the LangGraph graph (in the `fetch_data` node). The interface contract is simple: the node must populate `news_data` in the graph state with a list of article-like objects before the `filter_news` agent runs.
+
+To swap in a different news provider (e.g., a free RSS aggregator, a scraper, or a paid alternative such as Benzinga or Polygon.io News):
+
+1. Locate the `fetch_data` node in `agents/graph.py`.
+2. Replace the NewsAPI call with your provider's client.
+3. Normalize the output to match the structure the `filter_news` agent expects (a list of dicts with at least a title and description or content field).
+4. Update the API key reference in `config.py` and your `.env` file.
+
+<Note>
+  If your alternative source has no per-request limit (e.g., a self-hosted RSS scraper), you can safely increase `ACTIVE_UNIVERSE_LIMIT` to 503 without worrying about the 100-request ceiling. OpenAI costs still apply.
+</Note>

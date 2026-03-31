@@ -1,0 +1,77 @@
+---
+title: 'Environment setup'
+description: 'Configure the API keys and environment variables required to run the MEME pipeline.'
+---
+
+MEME requires two external API keys to function: one for OpenAI (argument extraction, embeddings) and one for NewsAPI (real-time news ingestion). You store both in a `.env` file at the project root, and `python-dotenv` loads them automatically at startup.
+
+## Create the .env file
+
+Copy the provided example file and fill in your real keys:
+
+```bash
+cp .env.example .env
+```
+
+Your `.env` file should look like this once populated:
+
+```env
+# OpenAI API Key for Argument Extraction and Cluster Generation
+OPENAI_API_KEY=sk-proj-...
+
+# NewsAPI Key for real-time market event extraction (Free or Premium)
+NEWSAPI_KEY=abc123...
+```
+
+<Warning>
+  Never commit your `.env` file to version control. It contains secret credentials. The repository's `.gitignore` should already exclude it — verify this before pushing.
+</Warning>
+
+## Environment variables
+
+<ParamField path="OPENAI_API_KEY" type="string" required>
+  Your OpenAI API key. Used by both the LLM agents (argument filtering and extraction) and the embeddings model. Obtain it from the [OpenAI platform](https://platform.openai.com/api-keys) under **API keys**.
+</ParamField>
+
+<ParamField path="NEWSAPI_KEY" type="string" required>
+  Your NewsAPI key. Used to fetch recent news articles for each ticker in the active universe. Obtain it from [NewsAPI.org](https://newsapi.org/register) after registering an account. The free tier supports up to 100 requests per day.
+</ParamField>
+
+## How the keys are read
+
+`config.py` and the `data_fetcher/news.py` module both call `load_dotenv()` at import time, which reads the `.env` file and injects its values into the process environment. `config.py` exposes the OpenAI key as a module-level constant; the news fetcher reads the NewsAPI key directly from the environment:
+
+```python
+# config.py
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+NEWSAPI_KEY    = os.getenv("NEWS_API_KEY")   # reads NEWS_API_KEY from env
+
+# data_fetcher/news.py — reads NEWSAPI_KEY directly
+api_key = os.getenv("NEWSAPI_KEY")
+```
+
+<Note>
+  There is a naming split in the source: `config.py` reads the env var `NEWS_API_KEY` and stores it as the Python constant `NEWSAPI_KEY`, while `data_fetcher/news.py` reads the env var `NEWSAPI_KEY` directly. The `.env.example` file uses `NEWSAPI_KEY`. Set `NEWSAPI_KEY` in your `.env` file so that `data_fetcher/news.py` can find it; if you also need `config.py`'s `NEWSAPI_KEY` constant to be populated, add `NEWS_API_KEY` as well with the same value.
+</Note>
+
+## Verify the setup
+
+After creating your `.env` file, confirm the keys load correctly before running the full pipeline:
+
+```python
+from config import OPENAI_API_KEY, NEWSAPI_KEY
+
+print("OpenAI key loaded:", bool(OPENAI_API_KEY))
+print("NewsAPI key loaded:", bool(NEWSAPI_KEY))
+```
+
+Both should print `True`. If either prints `False`, check that the variable name in your `.env` file matches exactly (`OPENAI_API_KEY` and `NEWSAPI_KEY`).
+
+<Note>
+  The `.env` file must be located in the project root — the same directory as `main.py` and `config.py`. `load_dotenv()` searches for it relative to the working directory when you launch the script.
+</Note>

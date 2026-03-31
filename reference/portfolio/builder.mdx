@@ -1,0 +1,414 @@
+---
+title: "Portfolio Builder"
+description: "Composite signal scoring and dual Long/Short portfolio construction from GMM posteriors and EMA momentum."
+---
+
+The `portfolio/builder.py` module converts narrative-level EMA momentum scores into per-ticker composite signals and selects a dual Long/Short portfolio. The top 20% of signals go LONG; the bottom 20% go SHORT. Both sides apply equal weighting.
+
+## Composite signal formula
+
+```
+Signal_ticker = Σ  (P(k | arg) × polarity × EMA_k)
+                k
+```
+
+| Term | Source |
+|---|---|
+| `P(k \| arg)` | GMM posterior probability that this argument belongs to cluster `k` |
+| `polarity` | `+1` (bullish) or `−1` (bearish) — assigned by the LLM argument generator |
+| `EMA_k` | Exponential momentum score for narrative `k` from `evaluation/momentum.py` |
+
+A high positive signal means the ticker has several bullish arguments assigned to high-momentum narratives. A strongly negative signal indicates persistent bearish narratives.
+
+---
+
+## `score_tickers`
+
+Computes the composite signal for every ticker in the argument universe.
+
+```python
+score_tickers(
+    arguments: list[dict],
+    posteriors,       # np.ndarray shape (N, K)
+    ema_momentum: dict,
+    k_clusters: int,
+) -> dict
+```
+
+### Parameters
+
+<ParamField path="arguments" type="list[dict]" required>
+  Full list of investment arguments from the LangGraph pipeline. Each dict must contain `ticker` (string) and `polaridad` (`+1` or `−1`). Arguments for the same ticker accumulate their signals.
+</ParamField>
+
+<ParamField path="posteriors" type="np.ndarray" required>
+  GMM posterior matrix of shape `(N_arguments, K_clusters)`. `posteriors[i][k]` is the probability that argument `i` belongs to narrative `k`.
+</ParamField>
+
+<ParamField path="ema_momentum" type="dict" required>
+  Output of `calculate_ema` — `{cluster_id: ema_value}`. Narratives not present in this dict default to `0.0` momentum, contributing no signal.
+</ParamField>
+
+<ParamField path="k_clusters" type="int" required>
+  Number of GMM clusters. Determines the inner loop range for cluster iteration.
+</ParamField>
+
+### Returns
+
+```python
+{
+    "AAPL":  0.004512,
+    "MSFT":  0.002341,
+    "NVDA": -0.001823,
+}
+```
+
+<ResponseField name="ticker" type="str">
+  The stock symbol.
+</ResponseField>
+
+<ResponseField name="composite_signal" type="float">
+  Sum of `P(k | arg) × polarity × EMA_k` across all arguments for that ticker and all clusters. Positive = net bullish momentum backing; negative = net bearish.
+</ResponseField>
+
+### Source
+
+```python
+def score_tickers(
+    arguments: list[dict],
+    posteriors,  # np.ndarray (N, K)
+    ema_momentum: dict,  # {cluster_id: ema_value}
+    k_clusters: int,
+) -> dict:
+    """
+    Calcula la señal compuesta para cada ticker.
+
+    Returns:
+        dict {ticker: composite_signal}
+    """
+    import numpy as np
+
+    ticker_scores = defaultdict(float)
+
+    for idx, arg in enumerate(arguments):
+        ticker = arg.get("ticker", "UNKNOWN")
+        polarity = int(arg.get("polaridad", 0))
+
+        for cluster_id in range(k_clusters):
+            prob = posteriors[idx][cluster_id]
+            momentum = ema_momentum.get(cluster_id, 0.0)
+
+            # Señal = Probabilidad × Polaridad × Momentum
+            signal = prob * polarity * momentum
+            ticker_scores[ticker] += signal
+
+    return dict(ticker_scores)
+```
+
+---
+
+## `select_portfolio`
+
+Selects the LONG portfolio from the top N% of tickers by composite signal.
+
+```python
+select_portfolio(
+    ticker_scores: dict,
+    top_pct: float = 0.20,
+) -> list[dict]
+```
+
+### Parameters
+
+<ParamField path="ticker_scores" type="dict" required>
+  Output of `score_tickers` — `{ticker: signal}`.
+</ParamField>
+
+<ParamField path="top_pct" type="float" default="0.20">
+  Fraction of the universe to select. `0.20` selects the top 20%. Configurable via `PORTFOLIO_TOP_PERCENTILE` in `config.py`. The selection floor is always at least 1 ticker (`max(1, int(n * top_pct))`).
+</ParamField>
+
+### Selection logic
+
+1. Sort tickers from highest to lowest signal.
+2. Take the top `N = max(1, int(total × top_pct))` tickers.
+3. **Filter to positive signals only** — a ticker with a negative signal is not bought even if it ranks in the top N%.
+4. Apply equal weight: `weight = 1 / len(positive_tickers)`.
+
+If no tickers have a positive signal, the function returns an empty list and logs `"Modo defensivo"`.
+
+### Returns
+
+```python
+[
+    {"rank": 1, "ticker": "NVDA", "signal": 0.00831, "weight": 33.33, "side": "LONG"},
+    {"rank": 2, "ticker": "AAPL", "signal": 0.00412, "weight": 33.33, "side": "LONG"},
+    {"rank": 3, "ticker": "MSFT", "signal": 0.00201, "weight": 33.33, "side": "LONG"},
+]
+```
+
+<ResponseField name="rank" type="int">Rank within the portfolio (1 = strongest signal).</ResponseField>
+<ResponseField name="ticker" type="str">Stock symbol.</ResponseField>
+<ResponseField name="signal" type="float">Composite signal rounded to 6 decimal places.</ResponseField>
+<ResponseField name="weight" type="float">Percentage allocation, equal-weighted across all selected tickers.</ResponseField>
+<ResponseField name="side" type="str">Always `"LONG"` for this function.</ResponseField>
+
+### Source
+
+```python
+def select_portfolio(
+    ticker_scores: dict,
+    top_pct: float = 0.20,
+) -> list[dict]:
+    # Ordenar de mayor a menor señal
+    sorted_tickers = sorted(ticker_scores.items(), key=lambda x: x[1], reverse=True)
+
+    # Seleccionar Top N%
+    n_select = max(1, int(len(sorted_tickers) * top_pct))
+    top_tickers = sorted_tickers[:n_select]
+
+    # Solo incluir señales positivas (no comprar algo con señal negativa)
+    portfolio = []
+    positive_tickers = [(t, s) for t, s in top_tickers if s > 0]
+
+    if not positive_tickers:
+        print("  [PORTFOLIO LONG] ⚠ Ninguna acción con señal positiva. Modo defensivo.")
+        return []
+
+    # Equal Weight
+    weight = 1.0 / len(positive_tickers)
+
+    for rank, (ticker, signal) in enumerate(positive_tickers, 1):
+        portfolio.append({
+            "rank": rank,
+            "ticker": ticker,
+            "signal": round(signal, 6),
+            "weight": round(weight * 100, 2),  # Porcentaje
+            "side": "LONG",
+        })
+
+    return portfolio
+```
+
+---
+
+## `select_short_portfolio`
+
+Selects the SHORT portfolio from the bottom N% of tickers by composite signal.
+
+```python
+select_short_portfolio(
+    ticker_scores: dict,
+    bottom_pct: float = 0.20,
+) -> list[dict]
+```
+
+### Parameters
+
+<ParamField path="ticker_scores" type="dict" required>
+  Output of `score_tickers` — `{ticker: signal}`.
+</ParamField>
+
+<ParamField path="bottom_pct" type="float" default="0.20">
+  Fraction of the universe to select for shorting. Default `0.20` selects the bottom 20%. Configurable via `PORTFOLIO_BOTTOM_PERCENTILE` in `config.py`. Can be disabled entirely by setting `ENABLE_SHORT_PORTFOLIO = False`.
+</ParamField>
+
+### Selection logic
+
+1. Sort tickers from lowest to highest signal (worst first).
+2. Take the bottom `N = max(1, int(total × bottom_pct))` tickers.
+3. **Filter to strictly negative signals only** — a ticker with a zero or positive signal is never shorted.
+4. Apply equal weight: `weight = 1 / len(negative_tickers)`.
+
+If no tickers have a negative signal, the function returns an empty list.
+
+### Returns
+
+```python
+[
+    {"rank": 1, "ticker": "INTC", "signal": -0.00540, "weight": 50.0, "side": "SHORT"},
+    {"rank": 2, "ticker": "BA",   "signal": -0.00312, "weight": 50.0, "side": "SHORT"},
+]
+```
+
+<ResponseField name="rank" type="int">Rank within the short book (1 = most negative signal).</ResponseField>
+<ResponseField name="ticker" type="str">Stock symbol.</ResponseField>
+<ResponseField name="signal" type="float">Composite signal (negative) rounded to 6 decimal places.</ResponseField>
+<ResponseField name="weight" type="float">Percentage allocation, equal-weighted across all selected tickers.</ResponseField>
+<ResponseField name="side" type="str">Always `"SHORT"` for this function.</ResponseField>
+
+### Source
+
+```python
+def select_short_portfolio(
+    ticker_scores: dict,
+    bottom_pct: float = 0.20,
+) -> list[dict]:
+    # Ordenar de menor a mayor señal (los peores primero)
+    sorted_tickers = sorted(ticker_scores.items(), key=lambda x: x[1], reverse=False)
+
+    # Seleccionar Bottom N%
+    n_select = max(1, int(len(sorted_tickers) * bottom_pct))
+    bottom_tickers = sorted_tickers[:n_select]
+
+    # Solo incluir señales estrictamente negativas
+    portfolio = []
+    negative_tickers = [(t, s) for t, s in bottom_tickers if s < 0]
+
+    if not negative_tickers:
+        print("  [PORTFOLIO SHORT] ⚠ Ninguna acción con señal negativa. Sin posiciones cortas.")
+        return []
+
+    # Equal Weight
+    weight = 1.0 / len(negative_tickers)
+
+    for rank, (ticker, signal) in enumerate(negative_tickers, 1):
+        portfolio.append({
+            "rank": rank,
+            "ticker": ticker,
+            "signal": round(signal, 6),
+            "weight": round(weight * 100, 2),  # Porcentaje
+            "side": "SHORT",
+        })
+
+    return portfolio
+```
+
+<Warning>
+  Short selling requires your broker to support margin accounts. The SHORT portfolio is disabled by default when `ENABLE_SHORT_PORTFOLIO = False` in `config.py`. In that case, `main.py` skips the call to `select_short_portfolio` and saves an empty short list.
+</Warning>
+
+---
+
+## `print_portfolio_report`
+
+Prints a formatted dual portfolio report to the console. This is a display-only function with no return value.
+
+```python
+print_portfolio_report(
+    long_portfolio: list[dict],
+    short_portfolio: list[dict],
+    ticker_scores: dict,
+    ema_momentum: dict,
+    run_date: str,
+)
+```
+
+### Parameters
+
+<ParamField path="long_portfolio" type="list[dict]" required>
+  Output of `select_portfolio`.
+</ParamField>
+
+<ParamField path="short_portfolio" type="list[dict]" required>
+  Output of `select_short_portfolio`. Pass an empty list `[]` when shorting is disabled.
+</ParamField>
+
+<ParamField path="ticker_scores" type="dict" required>
+  Full `{ticker: signal}` mapping for all tickers — used to print the complete signal table.
+</ParamField>
+
+<ParamField path="ema_momentum" type="dict" required>
+  `{cluster_id: ema_value}` — used to print the top 5 narratives by momentum.
+</ParamField>
+
+<ParamField path="run_date" type="str" required>
+  ISO date string shown in the report header.
+</ParamField>
+
+The report includes four sections:
+
+- LONG portfolio table (rank, ticker, signal, weight)
+- SHORT portfolio table (rank, ticker, signal, weight)
+- Full signal table for all tickers with LONG/SHORT labels
+- Top 5 narratives by EMA with ASCII bar chart
+
+<Tip>
+  If both portfolios are empty (no signals in either direction), the function prints `"Cash is king"` and returns early. This is the defensive mode triggered when market conditions produce no confident narrative signal.
+</Tip>
+
+### Source
+
+```python
+def print_portfolio_report(
+    long_portfolio: list[dict],
+    short_portfolio: list[dict],
+    ticker_scores: dict,
+    ema_momentum: dict,
+    run_date: str,
+):
+    """Imprime el reporte completo del portafolio dual (Long + Short)."""
+    print(f"\n{'═' * 65}")
+    print(f"  📊 PORTAFOLIO MEME — {run_date}")
+    print(f"{'═' * 65}")
+
+    has_long = bool(long_portfolio)
+    has_short = bool(short_portfolio)
+
+    if not has_long and not has_short:
+        print("  ⚠ No se generó portafolio (sin señales suficientes). Cash is king.")
+        print(f"{'═' * 65}")
+        return
+
+    # ── LONG Portfolio ──
+    if has_long:
+        print(f"\n  🟢 PORTAFOLIO LONG (Compra — Top {len(long_portfolio)} acciones):")
+        print(f"  {'RANK':<6} {'TICKER':<8} {'SEÑAL':>10} {'PESO':>8}")
+        print(f"  {'─'*6} {'─'*8} {'─'*10} {'─'*8}")
+        for p in long_portfolio:
+            print(f"  {p['rank']:<6} {p['ticker']:<8} {p['signal']:>10.6f} {p['weight']:>7.1f}%")
+    else:
+        print(f"\n  🟢 PORTAFOLIO LONG: ⚠ Sin posiciones (modo defensivo).")
+
+    # ── SHORT Portfolio ──
+    if has_short:
+        print(f"\n  🔴 PORTAFOLIO SHORT (Venta en Corto — Bottom {len(short_portfolio)} acciones):")
+        print(f"  {'RANK':<6} {'TICKER':<8} {'SEÑAL':>10} {'PESO':>8}")
+        print(f"  {'─'*6} {'─'*8} {'─'*10} {'─'*8}")
+        for p in short_portfolio:
+            print(f"  {p['rank']:<6} {p['ticker']:<8} {p['signal']:>10.6f} {p['weight']:>7.1f}%")
+    else:
+        print(f"\n  🔴 PORTAFOLIO SHORT: ⚠ Sin posiciones (sin señales negativas).")
+
+    # ── Resumen de señales (todos los tickers) ──
+    sorted_all = sorted(ticker_scores.items(), key=lambda x: x[1], reverse=True)
+    for ticker, signal in sorted_all:
+        label = ""
+        if any(p["ticker"] == ticker for p in long_portfolio):
+            label = "← COMPRAR"
+        elif any(p["ticker"] == ticker for p in short_portfolio):
+            label = "← SHORTEAR"
+        print(f"  {ticker:<8} {signal:>12.6f}  {label}")
+
+    # ── Top narrativas por momentum ──
+    sorted_ema = sorted(ema_momentum.items(), key=lambda x: x[1], reverse=True)
+    for cluster_id, ema_val in sorted_ema[:5]:
+        bar = "▓" * max(1, int(abs(ema_val) * 500))
+        direction = "↗" if ema_val > 0 else "↘"
+        print(f"  Narrativa {cluster_id:2d}: {direction} EMA={ema_val:>8.5f}  {bar}")
+```
+
+---
+
+## Usage in the pipeline
+
+All four functions are called in sequence during **Phase 3** of `main.py`:
+
+```python
+# 3.6 — composite signal per ticker
+ticker_scores = score_tickers(valid_arguments, posteriors, ema_momentum, k)
+
+# 3.7 — LONG portfolio (Top 20%)
+long_portfolio = select_portfolio(ticker_scores, top_pct=PORTFOLIO_TOP_PERCENTILE)
+
+# 3.8 — SHORT portfolio (Bottom 20%, if enabled)
+short_portfolio = []
+if ENABLE_SHORT_PORTFOLIO:
+    short_portfolio = select_short_portfolio(ticker_scores, bottom_pct=PORTFOLIO_BOTTOM_PERCENTILE)
+
+# 3.9 — print dual report to console
+print_portfolio_report(long_portfolio, short_portfolio, ticker_scores, ema_momentum, run_date_str)
+
+# 3.10 — persist to database
+save_portfolio(run_date_str, long_portfolio, short_portfolio)
+```

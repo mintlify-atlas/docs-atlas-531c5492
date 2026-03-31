@@ -1,0 +1,84 @@
+---
+title: 'Parameters'
+description: 'All configurable parameters in config.py and main.py, with their defaults and effect on pipeline behavior.'
+---
+
+All parameters listed here live in `config.py` unless noted otherwise. Edit that file directly to change behavior — no command-line flags are needed.
+
+## AI models
+
+These constants control which OpenAI models the pipeline calls. Each model represents a cost-performance trade-off.
+
+<ParamField path="LLM_FILTER_MODEL" type="string" default="gpt-4o-mini">
+  The model used by the Filtering Agent (`F_filter`) to pre-process raw news, technical, and fundamental data into structured summaries. `gpt-4o-mini` is fast and cheap, which matters because this step runs once per ticker per data modality in parallel.
+</ParamField>
+
+<ParamField path="LLM_EXTRACTOR_MODEL" type="string" default="gpt-4o">
+  The model used by the Generating Agent (`F_gen`) to synthesize filtered summaries into structured Investment Arguments (polarity, justification, evidence). This is the most token-intensive call in the pipeline. `gpt-4o` provides the reasoning depth needed for reliable argument extraction.
+</ParamField>
+
+<ParamField path="EMBEDDING_MODEL" type="string" default="text-embedding-3-small">
+  The OpenAI embeddings model used to convert argument justifications and evidence into dense vectors for GMM clustering. `text-embedding-3-small` uses the same dimensional metric space as larger models but at lower cost and latency.
+</ParamField>
+
+## MEME system parameters
+
+These parameters control news ingestion, return history, and portfolio construction.
+
+<ParamField path="NEWS_DAYS_BACK" type="int" default="3">
+  How many calendar days back to search for news articles for each ticker via NewsAPI. A value of `3` captures the most recent business cycle without fetching stale information. Increasing this value raises NewsAPI request volume significantly — each additional day multiplies requests across the full active universe.
+</ParamField>
+
+<ParamField path="RETURNS_HISTORY_DAYS" type="int" default="50">
+  Defined in `config.py` as a reserved constant (value: `50`). It is not currently imported or consumed by any other module in the pipeline — return windows are handled internally by each evaluation function. This constant is available for future use if you extend the codebase to support longer historical lookback periods.
+</ParamField>
+
+<ParamField path="PORTFOLIO_TOP_PERCENTILE" type="float" default="0.20">
+  The fraction of the ranked universe selected for the long portfolio. At `0.20`, the top 20% of tickers by composite signal score are included with equal weight. Lowering this value concentrates the long book in higher-conviction names; raising it diversifies across more tickers with weaker signals.
+</ParamField>
+
+<ParamField path="PORTFOLIO_BOTTOM_PERCENTILE" type="float" default="0.20">
+  The fraction of the ranked universe selected for the short portfolio. At `0.20`, the bottom 20% of tickers — those with the worst narrative scores — are shorted with equal weight. Only used when `ENABLE_SHORT_PORTFOLIO` is `True`.
+</ParamField>
+
+<ParamField path="ENABLE_SHORT_PORTFOLIO" type="bool" default="True">
+  When `True`, the pipeline constructs a short portfolio from the bottom percentile of narrative scores in addition to the long portfolio. Set to `False` to run a long-only strategy and skip short position generation entirely.
+</ParamField>
+
+<ParamField path="ACTIVE_UNIVERSE_LIMIT" type="int" default="10">
+  The number of S&P 500 tickers processed per daily run. The full S&P 500 list is fetched from Wikipedia at startup and then sliced to this limit: `active_universe = UNIVERSE[:ACTIVE_UNIVERSE_LIMIT]`. This single parameter controls pipeline cost, runtime, and API usage more than any other setting.
+</ParamField>
+
+<Warning>
+  Increasing `ACTIVE_UNIVERSE_LIMIT` beyond 100 will exceed the NewsAPI free tier limit of 100 requests per day, causing HTTP 426 or 429 errors for tickers beyond the 100th. Processing all 500 S&P 500 companies daily with `gpt-4o` will generate significant OpenAI charges. Estimate your per-run token cost before scaling.
+</Warning>
+
+<Tip>
+  Keep `ACTIVE_UNIVERSE_LIMIT = 10` while setting up and validating the pipeline. This processes 10 tickers per run, stays well within NewsAPI free tier limits, and costs only a few cents per run in OpenAI usage. Scale up only after confirming all three phases complete successfully.
+</Tip>
+
+## Clustering
+
+<ParamField path="K_CLUSTERS" type="int">
+  The number of Gaussian mixture components (thinking modes) used in Phase 2. Derived automatically from `ACTIVE_UNIVERSE_LIMIT`:
+
+  ```python
+  K_CLUSTERS = 15 if ACTIVE_UNIVERSE_LIMIT <= 50 else 20
+  ```
+
+  This follows the empirical scaling from the original MEME paper: `K=15` for smaller universes (up to 50 stocks, comparable to the SSE 50 index) and `K=20` for larger universes (comparable to the CSI 300/500). You do not set this value directly — it updates whenever you change `ACTIVE_UNIVERSE_LIMIT`.
+
+  At runtime, `main.py` also applies a floor: if the number of valid arguments generated is less than `K_CLUSTERS`, the model uses `min(3, len(valid_arguments))` components instead to prevent the GMM from failing on an underdetermined system.
+</ParamField>
+
+## EMA smoothing
+
+<ParamField path="EMA_ALPHA" type="float" default="0.2">
+  The exponential moving average smoothing factor applied to narrative mode returns in Phase 3. Defined in `main.py` at line 71:
+
+  ```python
+  EMA_ALPHA = 0.2  # Exponential smoothing factor
+  ```
+
+  A value of `0.2` gives 20% weight to the most recent day's returns and 80% to the accumulated historical EMA, smoothing out short-term noise so that only narratives with consistent performance influence portfolio construction. Lower values (e.g., `0.1`) create slower-reacting, more stable signals; higher values (e.g., `0.4`) make signals more reactive to recent returns.
+</ParamField>

@@ -1,0 +1,151 @@
+---
+title: 'Scheduling'
+description: 'Run MEME manually for testing or automate it with Windows Task Scheduler for daily post-market execution.'
+---
+
+MEME supports two execution modes: manual runs for testing and development, and automated daily scheduling for continuous forward-testing. Both modes activate the virtual environment and invoke `main.py` through `run_meme.bat`.
+
+## Manual execution
+
+Run `run_meme.bat` directly from File Explorer (double-click) or from a terminal:
+
+```batch
+run_meme.bat
+```
+
+Or invoke the Python entry point directly if your virtual environment is already activated:
+
+```bash
+python main.py
+```
+
+The contents of `run_meme.bat` are:
+
+```batch
+@echo off
+REM  SISTEMA MEME — Ejecución Automatizada
+REM  Programado para ejecutarse diariamente a las 6:00 PM (Hora Perú)
+
+echo [%date% %time%] Iniciando Sistema MEME...
+
+REM Activar entorno virtual
+call "%~dp0venv\Scripts\activate.bat"
+
+REM Ejecutar pipeline completo
+python "%~dp0main.py"
+
+echo [%date% %time%] Sistema MEME finalizado.
+
+REM Registrar log
+echo [%date% %time%] Ejecucion completada >> "%~dp0meme_logs.txt"
+
+pause
+```
+
+The script activates the `venv` virtual environment relative to its own location (`%~dp0`), runs `main.py`, and appends a timestamped completion entry to `meme_logs.txt` in the project root.
+
+Use manual execution when:
+- Setting up the project for the first time and validating the pipeline end-to-end.
+- Running one-off analyses on a specific date.
+- Debugging failures in any of the three phases.
+
+## Automated scheduling
+
+For continuous forward-testing, schedule MEME to run every business day after the US market closes using Windows Task Scheduler.
+
+### Why 18:00 Peru Time
+
+NYSE closes at 16:30 Eastern Time. Peru is in the UTC-5 time zone (no daylight saving time), which is the same offset as Eastern Standard Time. The 18:00 Peru Time schedule runs one and a half hours after market close, ensuring:
+
+- **Close prices are fully available** on all data providers (yfinance) without risk of incomplete or delayed end-of-day data.
+- **Daily news cycle is captured** — end-of-session earnings announcements, analyst upgrades, and macro releases are all indexed by NewsAPI by this time.
+- **Consistent database accumulation** — the EMA momentum and Hungarian alignment in Phase 3 depend on daily runs landing at predictable times to build coherent historical state.
+
+### Register the scheduled task
+
+<Warning>
+  You must run `setup_schedule.bat` as Administrator. The script uses `schtasks /create /rl HIGHEST` which requires elevated privileges. Right-click the file and select **Run as administrator**. If you run it without elevation, the task will not be registered and you will see an error message.
+</Warning>
+
+<Steps>
+  <Step title="Open File Explorer and locate setup_schedule.bat">
+    Navigate to the project root directory where `setup_schedule.bat` is located.
+  </Step>
+  <Step title="Run as Administrator">
+    Right-click `setup_schedule.bat` and select **Run as administrator**. Confirm the UAC prompt if it appears.
+  </Step>
+  <Step title="Confirm successful registration">
+    The script outputs a confirmation message if the task registers successfully:
+
+    ```
+    Registrando tarea programada "MEME_DailyRun"...
+    Hora de ejecucion: 18:00 (6 PM hora Peru)
+
+    ✓ Tarea "MEME_DailyRun" registrada exitosamente.
+      Se ejecutara todos los dias a las 6:00 PM.
+    ```
+
+    If you see `✗ Error registrando la tarea`, re-run the script with Administrator privileges.
+  </Step>
+  <Step title="Verify the task in Windows Task Scheduler">
+    Open **Task Scheduler** from the Start menu, or run the following command to query the task directly:
+
+    ```batch
+    schtasks /query /tn "MEME_DailyRun"
+    ```
+
+    You should see the task listed with a **Daily** schedule at 18:00 and status **Ready**.
+  </Step>
+</Steps>
+
+The underlying `schtasks` command registered by the script is:
+
+```batch
+schtasks /create ^
+    /tn "MEME_DailyRun" ^
+    /tr "\"%~dp0run_meme.bat\"" ^
+    /sc daily ^
+    /st 18:00 ^
+    /rl HIGHEST ^
+    /f
+```
+
+| Flag | Value | Meaning |
+|------|-------|---------|
+| `/tn` | `MEME_DailyRun` | Task name used to identify, query, and delete the task |
+| `/tr` | path to `run_meme.bat` | The program to run |
+| `/sc daily` | — | Run once per day |
+| `/st` | `18:00` | Start time (18:00 local system time) |
+| `/rl HIGHEST` | — | Run with highest available privileges |
+| `/f` | — | Force-create, overwriting any existing task with the same name |
+
+<Note>
+  The scheduled time is based on the **local system clock**. If your machine is not set to Peru Time (UTC-5, America/Lima), adjust `/st` to the equivalent time in your system's time zone so that execution still falls one and a half hours after NYSE close at 16:30 ET.
+</Note>
+
+### Modify the schedule
+
+To change the execution time — for example, to 19:00 — delete the existing task and re-register it with a new start time:
+
+```batch
+schtasks /delete /tn "MEME_DailyRun" /f
+schtasks /create /tn "MEME_DailyRun" /tr "\"C:\path\to\run_meme.bat\"" /sc daily /st 19:00 /rl HIGHEST /f
+```
+
+### Remove the scheduled task
+
+To stop automated execution entirely, delete the task:
+
+```batch
+schtasks /delete /tn "MEME_DailyRun" /f
+```
+
+This removes the task from Windows Task Scheduler without affecting any project files or the accumulated database history.
+
+### Runtime requirements
+
+The machine must meet these conditions at the scheduled time for the run to complete successfully:
+
+- **Internet connection active** — the pipeline fetches the live S&P 500 ticker list from Wikipedia, news from NewsAPI, and price data from yfinance. A disconnected or firewalled environment will cause all three phases to fail.
+- **Virtual environment intact** — `run_meme.bat` activates `venv\Scripts\activate.bat` relative to the script's location. Do not move or delete the `venv` directory after scheduling.
+- **Machine not sleeping** — Windows Task Scheduler will not wake a sleeping machine by default. Configure your power settings to prevent sleep during the scheduled window, or enable **Wake the computer to run this task** in the task's **Conditions** tab within Task Scheduler.

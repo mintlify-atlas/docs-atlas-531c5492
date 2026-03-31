@@ -1,0 +1,166 @@
+---
+title: "Mode identification"
+description: "How Phase 2 of the MEME pipeline converts Investment Arguments into embeddings, discovers K latent market narratives with a Gaussian Mixture Model, and uses the Hungarian algorithm to keep mode IDs stable across trading days."
+---
+
+## Why GMM instead of k-means
+
+K-means assigns each argument to exactly one cluster. Real market narratives don't work that way — a "rising-rate environment pressures tech valuations" argument is simultaneously about interest rates, growth multiples, and sector rotation. Hard assignment would discard that nuance.
+
+A **Gaussian Mixture Model (GMM)** assigns each argument a *probability distribution* over all K modes. Every argument belongs to every mode to some degree, and the sum of those probabilities equals 1. This **soft/probabilistic membership** captures the overlapping nature of market narratives and produces richer signals downstream.
+
+<Info>
+The posterior probability vector for a single argument is a row in the matrix ω (omega) of shape (N_arguments, K). Each row sums to 1. In portfolio construction, this entire row is used — not just the argmax — so even a 15% membership in a high-momentum mode contributes to the ticker's composite signal.
+</Info>
+
+## Embedding arguments into vector space
+
+Before clustering, each argument's text must be converted into a numeric vector that captures semantic meaning. The `prepare_argument_for_embedding()` function in `clustering/embeddings.py` concatenates the justification and evidence fields:
+
+```python
+def prepare_argument_for_embedding(argument: dict) -> str:
+    """
+    Concatenates the reasoning and evidence to create the
+    semantic input required for grouping narratives.
+    """
+    justificacion = argument.get("justificacion", "")
+    evidencia = argument.get("evidencia", "")
+    return f"{justificacion} | Evidencia: {evidencia}"
+```
+
+The polarity field is intentionally excluded. GMM clustering operates on the *content* of the reasoning, not on the directional label. Two arguments with opposite polarities can legitimately belong to the same mode if they reference the same narrative (e.g., one is bullish on interest rate stability and another is bearish on the same theme).
+
+The concatenated text is sent to OpenAI's **`text-embedding-3-small`** model (`EMBEDDING_MODEL` in `config.py`):
+
+```python
+def get_embeddings(texts: list[str]) -> list[list[float]]:
+    """
+    Generates vector embeddings for a list of texts
+    using the model defined in config for OpenAI.
+    """
+    client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+
+    response = client.embeddings.create(
+        input=texts,
+        model=EMBEDDING_MODEL
+    )
+    return [data.embedding for data in response.data]
+```
+
+All texts are submitted in a single batched API call. The result is a list of high-dimensional float vectors — one per argument — which are stacked into a NumPy array `embeddings_np` of shape `(N_arguments, D)`.
+
+## GMM training
+
+The `ModeIdentifierGMM` class in `clustering/gmm_model.py` wraps scikit-learn's `GaussianMixture` with the paper's recommended parameters:
+
+```python
+class ModeIdentifierGMM:
+    def __init__(self, n_components: int = 15):
+        """
+        Initializes the Gaussian Mixture Model.
+        K = 15 narratives (thinking modes) following the base paper for 50 stocks.
+        """
+        self.n_components = n_components
+        self.gmm = GaussianMixture(
+            n_components=n_components,
+            covariance_type='full',
+            random_state=42
+        )
+
+    def fit(self, embeddings: np.ndarray):
+        """Trains the GMM on the daily argument embedding set."""
+        if len(embeddings) < self.n_components:
+            print("Warning: Fewer arguments than components (K). GMM may overfit severely.")
+        self.gmm.fit(embeddings)
+
+    def get_posteriors(self, embeddings: np.ndarray) -> np.ndarray:
+        """
+        Computes the probability that each argument (row) belongs to each mode (column).
+        Returns the omega matrix (ω).
+        """
+        return self.gmm.predict_proba(embeddings)
+
+    def get_centroids(self) -> np.ndarray:
+        """Returns the center of each mode (the Gaussian means µ)."""
+        return self.gmm.means_
+```
+
+### Choosing K
+
+The number of components K is read from `config.py` and scales with the universe size:
+
+```python
+# K=15 for small universes (<=50 tickers), K=20 for large ones (CSI 300/500 scale)
+K_CLUSTERS = 15 if ACTIVE_UNIVERSE_LIMIT <= 50 else 20
+```
+
+These values follow the original paper's empirical scaling. You can override K by changing `ACTIVE_UNIVERSE_LIMIT` — or by setting `K_CLUSTERS` directly in `config.py`.
+
+<Warning>
+If the total number of valid arguments generated in Phase 1 is less than K, the GMM will overfit severely. In `main.py`, a guard reduces K dynamically: `k = K_CLUSTERS if len(valid_arguments) >= K_CLUSTERS else min(3, len(valid_arguments))`.
+</Warning>
+
+### The posterior matrix ω
+
+After fitting, `get_posteriors()` returns the **omega matrix**:
+
+```
+ω  shape: (N_arguments, K)
+
+        Mode 0   Mode 1   Mode 2  ... Mode K-1
+Arg 0  [ 0.72    0.08     0.01   ...  0.03   ]
+Arg 1  [ 0.02    0.61     0.14   ...  0.11   ]
+Arg 2  [ 0.11    0.07     0.55   ...  0.09   ]
+...
+```
+
+Each row sums to 1.0. A row with a single dominant value (e.g., 0.72) indicates a clearly defined argument; a diffuse row indicates an argument that spans multiple narratives.
+
+## Temporal alignment with the Hungarian algorithm
+
+Each time the GMM is fitted on a new day's embeddings, scikit-learn has no reason to assign mode IDs consistently. A narrative that was "Mode 3" on Monday might emerge as "Mode 11" on Tuesday, even if its semantic content is identical. If uncorrected, the EMA momentum tracker would attribute Tuesday's returns to the wrong historical track record.
+
+The **Hungarian algorithm** (also known as the linear assignment algorithm) solves this problem by finding the permutation of today's mode IDs that minimizes total Euclidean distance to yesterday's centroids:
+
+```python
+def align_modes(centroids_t_minus_1: np.ndarray, centroids_t: np.ndarray) -> dict:
+    """
+    Performs temporal alignment of Thinking Modes from day T-1 to day T.
+    Uses the Hungarian Algorithm (linear_sum_assignment) on the Euclidean distance matrix.
+
+    Returns a dict mapping {old_index: new_index}.
+    For example, if narrative 0 from T-1 is now narrative 3 in T, key 0 maps to value 3.
+    """
+    # Compute pairwise Euclidean distances between all (T-1, T) centroid pairs
+    distance_matrix = cdist(centroids_t_minus_1, centroids_t, metric='euclidean')
+
+    # Apply Hungarian Algorithm (minimum total matching cost)
+    row_ind, col_ind = linear_sum_assignment(distance_matrix)
+
+    # Build assignment map
+    mapping = {int(old_idx): int(new_idx) for old_idx, new_idx in zip(row_ind, col_ind)}
+
+    return mapping
+```
+
+The returned `cluster_mapping` dictionary — `{old_id: new_id}` — is passed to the EMA calculator in Phase 3 so that yesterday's momentum values are correctly attributed to today's (realigned) mode IDs.
+
+<Tip>
+On the first day of operation there are no previous centroids in the database, so `cluster_mapping` is `None` and no alignment is performed. EMA values for all modes start at 0.0.
+</Tip>
+
+### Why minimize Euclidean distance between centroids?
+
+The centroid of a GMM component is the mean vector of its Gaussian distribution in embedding space. Two centroids that are close in that space represent semantically similar market narratives. By minimizing the total distance across all K pairings, the Hungarian algorithm finds the bijection that maximizes semantic continuity across days — the core idea behind "combating temporal semantic drift" from the original paper.
+
+## Persisting results
+
+Once clustering and alignment are complete, `main.py` saves the day's run to SQLite via `save_daily_run()`:
+
+- All valid arguments with their ticker and polarity
+- The full posterior matrix ω
+- The centroid matrix (shape K × D)
+- The number of clusters K
+- The universe size
+
+The stored centroids become `prev_centroids` on the next trading day, enabling the Hungarian alignment to run continuously as the system accumulates history.

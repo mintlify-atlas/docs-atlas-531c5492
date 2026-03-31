@@ -1,0 +1,253 @@
+---
+title: "Portfolio construction"
+description: "How Phase 3 of the MEME pipeline measures narrative accuracy with close-to-close returns, smooths track records with EMA momentum, computes a composite signal per ticker, and selects an equal-weight long/short portfolio."
+---
+
+## Close-to-close return measurement
+
+At the end of each trading day, MEME measures how accurate yesterday's arguments were. The metric is the **close-to-close return**: the percentage change between the two most recent closing prices for each ticker.
+
+```python
+if len(closes) >= 2:
+    # Return between the two most recent available closes
+    ret = (closes.iloc[-1] - closes.iloc[-2]) / closes.iloc[-2]
+    returns[ticker] = float(ret)
+```
+
+`get_daily_returns()` in `evaluation/returns.py` downloads a 10-day window of history per ticker to handle weekends and market holidays. It uses a single batched `yf.download()` call across all tickers to minimize API round-trips.
+
+### Polarity-adjusted returns
+
+A raw return alone is not enough — you need to know whether a given argument *predicted* the direction correctly. `calculate_cluster_returns()` multiplies each ticker's return by the argument's polarity before aggregating:
+
+```python
+# Polarity-adjusted return: if a bearish argument (-1) was correct and the stock fell,
+# the product is positive → the narrative "was right"
+adjusted_return = polarity * real_return
+```
+
+Each argument's adjusted return is then distributed across all K clusters, weighted by its GMM posterior probability:
+
+```python
+for cluster_id in range(k_clusters):
+    prob = posteriors[idx][cluster_id]
+    if prob > 0.01:  # Skip clusters with negligible probability
+        cluster_weighted_returns[cluster_id].append(prob * adjusted_return)
+```
+
+The cluster's daily return is the mean of all these weighted contributions. A cluster whose arguments consistently predicted the right direction will accumulate a positive track record.
+
+## EMA momentum
+
+A single day of bad returns should not destroy a narrative's long-term track record, and a single lucky day should not elevate a weak narrative. **Exponential Moving Average (EMA)** smoothing handles this by giving each day's return a fixed weight α and carrying forward (1 − α) of all prior history:
+
+```
+EMA_t = α × Return_t + (1 − α) × EMA_{t-1}
+```
+
+MEME uses **α = 0.2** (`EMA_ALPHA` in `main.py`):
+
+- 20% of the weight goes to today's return.
+- 80% of the weight carries forward the accumulated historical momentum.
+
+A narrative that is consistently profitable builds up a large positive EMA over many days. A single bad day moves the EMA by at most 20 percentage points of that day's return — it cannot flip a strong track record overnight.
+
+The `calculate_ema()` function in `evaluation/momentum.py`:
+
+```python
+def calculate_ema(
+    current_returns: dict,
+    previous_ema: dict,
+    alpha: float = 0.2,
+    cluster_mapping: dict = None,
+) -> dict:
+    """
+    Computes updated EMA for each cluster.
+
+    Args:
+        current_returns: {cluster_id: avg_return_today}
+        previous_ema: {old_cluster_id: ema_value} from the previous day (from DB).
+        alpha: Smoothing factor (0.2 default = 20% weight to today).
+        cluster_mapping: {old_cluster_id: new_cluster_id} from temporal alignment.
+                         If None, assumes IDs match (first day or no changes).
+    """
+    new_ema = {}
+
+    for cluster_id, today_return in current_returns.items():
+        if cluster_mapping:
+            old_cluster_id = None
+            for old_id, new_id in cluster_mapping.items():
+                if new_id == cluster_id:
+                    old_cluster_id = old_id
+                    break
+            prev_ema_value = previous_ema.get(old_cluster_id, 0.0) if old_cluster_id is not None else 0.0
+        else:
+            prev_ema_value = previous_ema.get(cluster_id, 0.0)
+
+        # EMA formula
+        new_ema[cluster_id] = alpha * today_return + (1 - alpha) * prev_ema_value
+
+    return new_ema
+```
+
+<Note>
+The `cluster_mapping` parameter threads the Hungarian alignment result from Phase 2 directly into the EMA update. When mode IDs shuffle between days, the EMA correctly attributes yesterday's track record (by old ID) to today's semantically equivalent cluster (by new ID).
+</Note>
+
+## Composite signal formula
+
+Once EMA momentum values are available for all K modes, MEME computes a **composite signal** for each ticker by summing contributions from every argument about that ticker, across every mode:
+
+```
+Signal_ticker = Σ_k Σ_i (ω_{i,k} × p_i × EMA_k)
+```
+
+Where:
+- `ω_{i,k}` is the GMM posterior probability of argument `i` belonging to mode `k`
+- `p_i` is the polarity of argument `i` (+1 or −1)
+- `EMA_k` is the momentum of mode `k`
+
+The `score_tickers()` function in `portfolio/builder.py` implements this directly:
+
+```python
+def score_tickers(
+    arguments: list[dict],
+    posteriors,  # np.ndarray (N, K)
+    ema_momentum: dict,  # {cluster_id: ema_value}
+    k_clusters: int,
+) -> dict:
+    """
+    Computes the composite signal for each ticker.
+
+    Returns:
+        dict {ticker: composite_signal}
+    """
+    ticker_scores = defaultdict(float)
+
+    for idx, arg in enumerate(arguments):
+        ticker = arg.get("ticker", "UNKNOWN")
+        polarity = int(arg.get("polaridad", 0))
+
+        for cluster_id in range(k_clusters):
+            prob = posteriors[idx][cluster_id]
+            momentum = ema_momentum.get(cluster_id, 0.0)
+
+            # Signal = Probability × Polarity × Momentum
+            signal = prob * polarity * momentum
+            ticker_scores[ticker] += signal
+
+    return dict(ticker_scores)
+```
+
+A ticker with multiple bullish arguments that are strongly associated with high-momentum modes will accumulate a large positive signal. A ticker with bearish arguments tied to modes that have been consistently right will accumulate a large negative signal.
+
+## Long portfolio selection
+
+`select_portfolio()` takes the top 20% of tickers by composite signal, then applies a hard filter: **only tickers with a strictly positive signal are included**.
+
+```python
+def select_portfolio(ticker_scores: dict, top_pct: float = 0.20) -> list[dict]:
+    # Sort highest to lowest
+    sorted_tickers = sorted(ticker_scores.items(), key=lambda x: x[1], reverse=True)
+
+    # Select top N%
+    n_select = max(1, int(len(sorted_tickers) * top_pct))
+    top_tickers = sorted_tickers[:n_select]
+
+    # Only include positive signals (do not buy something with a negative signal)
+    positive_tickers = [(t, s) for t, s in top_tickers if s > 0]
+
+    if not positive_tickers:
+        print("  [PORTFOLIO LONG] ⚠ No stocks with positive signal. Defensive mode.")
+        return []
+
+    # Equal weight
+    weight = 1.0 / len(positive_tickers)
+
+    portfolio = []
+    for rank, (ticker, signal) in enumerate(positive_tickers, 1):
+        portfolio.append({
+            "rank": rank,
+            "ticker": ticker,
+            "signal": round(signal, 6),
+            "weight": round(weight * 100, 2),
+            "side": "LONG",
+        })
+
+    return portfolio
+```
+
+The portfolio is **equally weighted**: if 10 tickers qualify, each receives 10% of capital.
+
+## Short portfolio selection
+
+`select_short_portfolio()` mirrors the long logic but selects the bottom 20% of tickers by signal, keeping only those with a **strictly negative signal**:
+
+```python
+def select_short_portfolio(ticker_scores: dict, bottom_pct: float = 0.20) -> list[dict]:
+    # Sort lowest to highest (worst first)
+    sorted_tickers = sorted(ticker_scores.items(), key=lambda x: x[1], reverse=False)
+
+    n_select = max(1, int(len(sorted_tickers) * bottom_pct))
+    bottom_tickers = sorted_tickers[:n_select]
+
+    # Only short strictly negative signals
+    negative_tickers = [(t, s) for t, s in bottom_tickers if s < 0]
+
+    if not negative_tickers:
+        print("  [PORTFOLIO SHORT] ⚠ No stocks with negative signal. No short positions.")
+        return []
+
+    weight = 1.0 / len(negative_tickers)
+
+    portfolio = []
+    for rank, (ticker, signal) in enumerate(negative_tickers, 1):
+        portfolio.append({
+            "rank": rank,
+            "ticker": ticker,
+            "signal": round(signal, 6),
+            "weight": round(weight * 100, 2),
+            "side": "SHORT",
+        })
+
+    return portfolio
+```
+
+Short selling can be enabled or disabled globally via `ENABLE_SHORT_PORTFOLIO = True/False` in `config.py`.
+
+## Defensive cash mode
+
+The signal filters above mean MEME can produce an **empty portfolio** on either or both sides. This is intentional:
+
+- If the entire universe has negative or zero composite signals, the long portfolio is empty.
+- If the entire universe has positive or zero composite signals, the short portfolio is empty.
+- If both conditions hold simultaneously, neither portfolio is opened.
+
+```python
+if not has_long and not has_short:
+    print("  ⚠ No portfolio generated (insufficient signals). Cash is king.")
+    return
+```
+
+This "cash is king" behavior means MEME sits out rather than force positions when the prevailing market narrative environment is ambiguous or uniformly hostile. It acts as a built-in drawdown brake: if the narrative model detects no compelling directional consensus, it refuses to bet.
+
+<Tip>
+The defensive mode is most valuable during sharp regime transitions — e.g., when an unexpected macro event causes all narratives to flip simultaneously. On those days, MEME's EMA momentum values have not yet adjusted to the new regime, so the signal quality is low and holding cash is the correct response.
+</Tip>
+
+## Portfolio percentiles and configuration
+
+Both percentile thresholds are configurable in `config.py`:
+
+```python
+# Top 20% for long portfolio
+PORTFOLIO_TOP_PERCENTILE = 0.20
+
+# Bottom 20% for short portfolio
+PORTFOLIO_BOTTOM_PERCENTILE = 0.20
+
+# Enable or disable short selling
+ENABLE_SHORT_PORTFOLIO = True
+```
+
+The long and short portfolios are independently sized and weighted — a long position of 10% capital is not offset by any short. They are treated as two separate equal-weight books.

@@ -1,0 +1,213 @@
+---
+title: "Momentum"
+description: "Exponential Moving Average (EMA) smoothing for narrative momentum scores and ranked narrative output."
+---
+
+The `evaluation/momentum.py` module applies an Exponential Moving Average to each narrative's daily return, producing a smoothed momentum score. Narratives that are consistently right accumulate a high EMA; a single bad day causes only a small decay rather than a reset.
+
+## EMA formula
+
+```
+EMA_t = α × Return_t + (1 − α) × EMA_{t−1}
+```
+
+| Symbol | Meaning |
+|---|---|
+| `α` (alpha) | Smoothing factor. Default `0.2` — 20% weight to today, 80% to history. |
+| `Return_t` | Polarity-adjusted cluster return for the current day (from `calculate_cluster_returns`). |
+| `EMA_{t−1}` | Previous day's EMA value loaded from the database via `get_previous_ema`. |
+
+A **higher alpha** makes the score more reactive to recent performance. A **lower alpha** creates a more stable, history-weighted score. The default `0.2` reflects the paper's empirical setting for medium-sized universes.
+
+---
+
+## `calculate_ema`
+
+Updates the EMA for every cluster using today's returns and yesterday's EMA values.
+
+```python
+calculate_ema(
+    current_returns: dict,
+    previous_ema: dict,
+    alpha: float = 0.2,
+    cluster_mapping: dict = None,
+) -> dict
+```
+
+### Parameters
+
+<ParamField path="current_returns" type="dict" required>
+  Output of `calculate_cluster_returns` — `{cluster_id: avg_return_today}`. Each key is a zero-based integer cluster ID; each value is the polarity-weighted average return for that narrative.
+</ParamField>
+
+<ParamField path="previous_ema" type="dict" required>
+  Previous day's EMA values loaded from the database — `{old_cluster_id: ema_value}`. Empty dict `{}` on the first run; the EMA initialization then defaults to `0.0` for all clusters.
+</ParamField>
+
+<ParamField path="alpha" type="float" default="0.2">
+  Smoothing factor in the range `(0, 1)`. Configured globally in `main.py` as `EMA_ALPHA = 0.2`.
+</ParamField>
+
+<ParamField path="cluster_mapping" type="dict" default="None">
+  Optional alignment dict `{old_cluster_id: new_cluster_id}` produced by `clustering/alignment.py`. When GMM is re-trained on a new day, cluster IDs can be permuted. This mapping tells `calculate_ema` which yesterday-cluster corresponds to each today-cluster so the correct prior EMA is carried forward.
+
+  If `None`, the function assumes cluster IDs are stable across days (first run, or no alignment changes).
+</ParamField>
+
+### How `cluster_mapping` is used
+
+When `cluster_mapping` is provided, for each `cluster_id` in today's results the function performs a **reverse lookup** to find the matching old cluster ID:
+
+```python
+for old_id, new_id in cluster_mapping.items():
+    if new_id == cluster_id:
+        old_cluster_id = old_id
+        break
+prev_ema_value = previous_ema.get(old_cluster_id, 0.0)
+```
+
+This ensures that if yesterday's narrative 3 is today's narrative 7 (due to GMM permutation), the EMA history is correctly transferred.
+
+### Returns
+
+<ResponseField name="cluster_id" type="int">
+  Zero-based cluster identifier matching the keys in `current_returns`.
+</ResponseField>
+
+<ResponseField name="new_ema_value" type="float">
+  Updated EMA: `α × Return_t + (1 − α) × EMA_{t−1}`.
+</ResponseField>
+
+```python
+{
+    0:  0.00412,
+    1: -0.00108,
+    2:  0.00031,
+}
+```
+
+### Source
+
+```python
+def calculate_ema(
+    current_returns: dict,
+    previous_ema: dict,
+    alpha: float = 0.2,
+    cluster_mapping: dict = None,
+) -> dict:
+    """
+    Calcula el EMA actualizado para cada cluster.
+
+    Args:
+        current_returns: {cluster_id: avg_return_today} del cálculo de returns.py.
+        previous_ema: {old_cluster_id: ema_value} del día anterior (de la DB).
+        alpha: Factor de suavizado (0.2 por defecto = 20% peso al día actual).
+        cluster_mapping: {old_cluster_id: new_cluster_id} de la alineación temporal.
+                         Si None, asume que los IDs coinciden (primer día o sin cambios).
+
+    Returns:
+        dict {cluster_id: new_ema_value}
+    """
+    new_ema = {}
+
+    for cluster_id, today_return in current_returns.items():
+        # Buscar el EMA previo de la narrativa alineada
+        if cluster_mapping:
+            # ¿Qué cluster de ayer corresponde al cluster de hoy?
+            old_cluster_id = None
+            for old_id, new_id in cluster_mapping.items():
+                if new_id == cluster_id:
+                    old_cluster_id = old_id
+                    break
+            prev_ema_value = previous_ema.get(old_cluster_id, 0.0) if old_cluster_id is not None else 0.0
+        else:
+            prev_ema_value = previous_ema.get(cluster_id, 0.0)
+
+        # Fórmula EMA
+        new_ema[cluster_id] = alpha * today_return + (1 - alpha) * prev_ema_value
+
+    return new_ema
+```
+
+---
+
+## `rank_narratives`
+
+Sorts all narratives by their EMA momentum score from highest to lowest.
+
+```python
+rank_narratives(ema_scores: dict) -> list[tuple]
+```
+
+### Parameters
+
+<ParamField path="ema_scores" type="dict" required>
+  Output of `calculate_ema` — `{cluster_id: ema_value}`. All clusters for the current run.
+</ParamField>
+
+### Returns
+
+A list of `(cluster_id, ema_value)` tuples sorted in descending order by EMA value. The first element is the narrative with the strongest positive momentum.
+
+```python
+[
+    (4,  0.00831),
+    (0,  0.00412),
+    (2,  0.00031),
+    (1, -0.00108),
+    (3, -0.00540),
+]
+```
+
+<ResponseField name="cluster_id" type="int">
+  Zero-based cluster identifier.
+</ResponseField>
+
+<ResponseField name="ema_value" type="float">
+  The narrative's current EMA momentum score. Positive means the narrative has been consistently correct; negative means it has been consistently wrong.
+</ResponseField>
+
+### Source
+
+```python
+def rank_narratives(ema_scores: dict) -> list[tuple]:
+    """
+    Ordena las narrativas por su EMA momentum (de mayor a menor).
+
+    Returns:
+        Lista de tuplas [(cluster_id, ema_value), ...] ordenadas descendentemente.
+    """
+    sorted_emas = sorted(ema_scores.items(), key=lambda x: x[1], reverse=True)
+    return sorted_emas
+```
+
+---
+
+## Usage in the pipeline
+
+Both functions are called in `main.py` during **Phase 3**:
+
+```python
+# Load previous day's EMA from the database
+prev_ema = get_previous_ema(run_date_str)
+
+# Update EMA with today's cluster returns
+ema_momentum = calculate_ema(
+    current_returns=cluster_returns,
+    previous_ema=prev_ema,
+    alpha=EMA_ALPHA,          # 0.2 from main.py
+    cluster_mapping=cluster_mapping,  # None on first run
+)
+
+# Rank and display top narratives
+ranked = rank_narratives(ema_momentum)
+for i, (cid, ema) in enumerate(ranked[:5], 1):
+    direction = "↗" if ema > 0 else "↘"
+    print(f"    {i}. Narrativa {cid:2d}: {direction} EMA={ema:.5f}")
+```
+
+The `ema_momentum` dict is then passed directly to `score_tickers` in `portfolio/builder.py` to build the composite signal for each stock.
+
+<Note>
+  On the first day (no prior database entries), `get_previous_ema` returns an empty dict, so `prev_ema_value` defaults to `0.0` for every cluster. The first EMA value is therefore simply `α × Return_t`.
+</Note>

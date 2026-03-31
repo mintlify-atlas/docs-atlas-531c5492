@@ -1,0 +1,99 @@
+---
+title: "The MEME system"
+description: "An overview of the Logic-Oriented paradigm and the three-phase pipeline that drives MEME: from raw market data to a ranked, signal-weighted portfolio."
+---
+
+## Logic-Oriented vs Object-Oriented paradigm
+
+Most quantitative trading systems are **Object-Oriented**: they train on raw numerical series (prices, volumes, ratios) and try to predict future returns directly. MEME takes the opposite approach.
+
+MEME is **Logic-Oriented**. Instead of predicting returns from numbers, it extracts and models the *underlying reasoning* that market participants use to justify their positions. The hypothesis is that price movements are downstream of narratives — and that modeling those narratives is more robust than fitting noisy return series directly.
+
+<Note>
+The Logic-Oriented paradigm was introduced in the original research paper [MEME: Modeling the Evolutionary Modes of Financial Markets (arXiv:2602.11918)](https://arxiv.org/abs/2602.11918). This implementation adapts it for real-time operation on the US market (S&P 500) using live data feeds.
+</Note>
+
+The key insight is that the same macroeconomic logic — "rising rates compress growth multiples," "supply-chain disruption pressures margins" — tends to affect many stocks simultaneously. By clustering these shared narratives into **Thinking Modes** and tracking which modes have been profitable, MEME produces a forward signal that is grounded in economic reasoning rather than curve-fitted to past returns.
+
+## The three-phase pipeline
+
+MEME processes the stock universe once per trading day, after market close, in three sequential phases:
+
+```
+Raw market data (yfinance + NewsAPI)
+        │
+        ▼
+┌───────────────────────────────┐
+│  Phase 1: Argument Extraction │
+│  LangGraph fan-out/fan-in     │
+│  → Investment Arguments JSON  │
+└───────────────┬───────────────┘
+                │
+                ▼
+┌─────────────────────────────────────┐
+│  Phase 2: Mode Identification       │
+│  OpenAI Embeddings → GMM → Hungarian│
+│  → Posterior matrix ω (N × K)       │
+└───────────────┬─────────────────────┘
+                │
+                ▼
+┌────────────────────────────────────────┐
+│  Phase 3: Portfolio Construction       │
+│  Close-to-Close returns → EMA momentum │
+│  → Composite signal → Long / Short     │
+└────────────────────────────────────────┘
+```
+
+<Steps>
+  <Step title="Phase 1 — Argument extraction">
+    For each ticker in the active universe, a LangGraph pipeline fetches technical indicators and fundamentals from **yfinance** and recent headlines from **NewsAPI**. Three specialist filter agents summarize each modality independently. A generator agent synthesizes the summaries into structured **Investment Argument** tuples: `A(t, s, i) = (p, a, e)` — polarity, justification, evidence.
+  </Step>
+
+  <Step title="Phase 2 — Mode identification and alignment">
+    Every argument's justification and evidence are concatenated and passed to OpenAI's `text-embedding-3-small` model, producing a high-dimensional vector. A **Gaussian Mixture Model (GMM)** with K components is fitted to the full embedding matrix. The GMM assigns each argument a probabilistic membership across all K modes, forming the posterior matrix ω. To keep mode IDs stable across days, the **Hungarian algorithm** realigns today's cluster centroids to yesterday's by minimizing total Euclidean distance.
+  </Step>
+
+  <Step title="Phase 3 — Portfolio construction">
+    After market close, actual **close-to-close returns** are downloaded for each ticker. Returns are aggregated by cluster, weighted by posterior probability and argument polarity, to measure how accurate each narrative was. An **EMA** (α = 0.2) smooths each narrative's track record over time. A composite signal per ticker — `Σ(GMM probability × polarity × EMA momentum)` — ranks the universe. The top 20% by positive signal form the **long portfolio**; the bottom 20% by negative signal form the **short portfolio**, both equally weighted.
+  </Step>
+</Steps>
+
+## Key design decisions for US market adaptation
+
+The original research evaluated MEME on Chinese equity indices (CSI 300, SSE 50). This implementation makes several adaptations for real-time US market operation:
+
+<AccordionGroup>
+  <Accordion title="Concurrent execution with LangGraph">
+    The three filter agents (technical, fundamental, news) run in a parallel fan-out inside a LangGraph `StateGraph`. This removes sequential bottlenecks and keeps per-ticker latency acceptable when running across hundreds of tickers.
+  </Accordion>
+
+  <Accordion title="Live data instead of historical dumps">
+    yfinance provides 6 months of price history and live fundamental ratios. NewsAPI fetches the last 3 days of headlines. Both are queried fresh on every daily run rather than from a pre-built dataset.
+  </Accordion>
+
+  <Accordion title="SQLite persistence">
+    Because EMA momentum and temporal alignment both require memory across days, every run persists its arguments, posteriors, centroids, and EMA values to a local SQLite database (`meme_history.db`). The pipeline reads yesterday's centroids and EMA values at startup.
+  </Accordion>
+
+  <Accordion title="Symmetric long/short portfolio">
+    The original paper focused on long-only strategies. This implementation adds a short leg: the bottom 20% of tickers by composite signal (where signal < 0) are sold short, testing whether persistently bearish narratives also destroy value.
+  </Accordion>
+
+  <Accordion title="Defensive cash mode">
+    If no ticker has a positive composite signal, the long portfolio is empty. If no ticker has a negative signal, the short portfolio is empty. The system will hold cash rather than force positions against the prevailing narrative environment.
+  </Accordion>
+</AccordionGroup>
+
+## Explore each phase in depth
+
+<CardGroup cols={3}>
+  <Card title="Argument extraction" icon="file-pen" href="/concepts/argument-extraction">
+    How LangGraph, filter agents, and the generator agent transform raw data into structured Investment Arguments.
+  </Card>
+  <Card title="Mode identification" icon="chart-scatter" href="/concepts/mode-identification">
+    How embeddings, GMM soft clustering, and the Hungarian alignment algorithm discover and track market narratives.
+  </Card>
+  <Card title="Portfolio construction" icon="briefcase" href="/concepts/portfolio-construction">
+    How EMA momentum, composite signals, and defensive logic translate narratives into a ranked long/short portfolio.
+  </Card>
+</CardGroup>
